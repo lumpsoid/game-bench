@@ -1,0 +1,252 @@
+// Load generator = the automated client. ONE program, pointed at each server in turn.
+// Every connection simulates a player: it JOINs a room, sends MOVE at a fixed rate
+// (open-loop — it does NOT wait for replies, so server stalls show up as latency),
+// reads SNAPSHOTs, and records end-to-end latency via the echoed seq.
+//
+// Zero external dependencies: latency goes into a built-in log-linear histogram
+// (~0.23%/bucket). Swap in HdrHistogram before publishing final numbers.
+package main
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	msgJoin     = 0x01
+	msgMove     = 0x02
+	msgJoined   = 0x81
+	msgSnapshot = 0x82
+)
+
+// ---- histogram: log-linear, 1 µs .. 100 s, 1000 sub-buckets/decade ----
+
+const (
+	decades   = 8
+	perDecade = 1000
+	nbuckets  = decades * perDecade
+)
+
+type Hist struct{ counts [nbuckets]uint64 }
+
+func idxFor(us float64) int {
+	if us < 1 {
+		us = 1
+	}
+	e := math.Log10(us)
+	if e < 0 {
+		e = 0
+	}
+	i := int(e * perDecade)
+	if i >= nbuckets {
+		i = nbuckets - 1
+	}
+	return i
+}
+func (h *Hist) record(us float64) { atomic.AddUint64(&h.counts[idxFor(us)], 1) }
+func valFor(i int) float64        { return math.Pow(10, float64(i)/perDecade) }
+func (h *Hist) percentile(p float64) float64 {
+	var total uint64
+	for i := range h.counts {
+		total += atomic.LoadUint64(&h.counts[i])
+	}
+	if total == 0 {
+		return 0
+	}
+	target := uint64(p * float64(total))
+	var c uint64
+	for i := range h.counts {
+		c += atomic.LoadUint64(&h.counts[i])
+		if c >= target {
+			return valFor(i)
+		}
+	}
+	return valFor(nbuckets - 1)
+}
+
+// ---- global counters ----
+
+var (
+	movesSent uint64
+	snapsRecv uint64
+	measured  uint64
+)
+
+// ---- wire helpers ----
+
+func writeFrame(nc net.Conn, payload []byte) error {
+	b := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(b, uint32(len(payload)))
+	copy(b[4:], payload)
+	_, err := nc.Write(b)
+	return err
+}
+func joinPayload(room uint32) []byte {
+	p := make([]byte, 5)
+	p[0] = msgJoin
+	binary.BigEndian.PutUint32(p[1:], room)
+	return p
+}
+func movePayload(seq uint32, dx, dy int16) []byte {
+	p := make([]byte, 9)
+	p[0] = msgMove
+	binary.BigEndian.PutUint32(p[1:], seq)
+	binary.BigEndian.PutUint16(p[5:], uint16(dx))
+	binary.BigEndian.PutUint16(p[7:], uint16(dy))
+	return p
+}
+func readFrame(nc net.Conn, header []byte) ([]byte, error) {
+	if _, err := io.ReadFull(nc, header); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(header)
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(nc, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func runConn(addr string, roomID uint32, rate int, dur, warm time.Duration, h *Hist, wg *sync.WaitGroup, start time.Time) {
+	defer wg.Done()
+	nc, err := net.Dial("tcp", addr)
+	if err != nil {
+		return
+	}
+	defer nc.Close()
+	if tc, ok := nc.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
+	if err := writeFrame(nc, joinPayload(roomID)); err != nil {
+		return
+	}
+	header := make([]byte, 4)
+	// A snapshot can race ahead of JOINED; skip until we get our id.
+	var myID uint32
+	for {
+		p, err := readFrame(nc, header)
+		if err != nil {
+			return
+		}
+		if p[0] == msgJoined {
+			myID = binary.BigEndian.Uint32(p[1:])
+			break
+		}
+	}
+
+	const ring = 256 // seq -> send time; window = ring/rate seconds (must exceed max RTT)
+	var sendAt [ring]int64
+
+	// reader
+	go func() {
+		hdr := make([]byte, 4)
+		for {
+			p, err := readFrame(nc, hdr)
+			if err != nil {
+				return
+			}
+			if p[0] != msgSnapshot {
+				continue
+			}
+			atomic.AddUint64(&snapsRecv, 1)
+			count := int(binary.BigEndian.Uint16(p[5:]))
+			off := 7
+			for k := 0; k < count; k++ {
+				if binary.BigEndian.Uint32(p[off:]) == myID {
+					lastSeq := binary.BigEndian.Uint32(p[off+12:])
+					if lastSeq != 0 {
+						if st := atomic.LoadInt64(&sendAt[lastSeq%ring]); st != 0 {
+							us := float64(time.Now().UnixNano()-st) / 1000.0
+							if us > 0 && time.Since(start) > warm {
+								h.record(us)
+								atomic.AddUint64(&measured, 1)
+							}
+						}
+					}
+					break
+				}
+				off += 16
+			}
+		}
+	}()
+
+	// sender (open-loop, fixed rate)
+	t := time.NewTicker(time.Second / time.Duration(rate))
+	defer t.Stop()
+	deadline := start.Add(warm + dur)
+	var seq uint32
+	for now := range t.C {
+		if now.After(deadline) {
+			return
+		}
+		seq++
+		atomic.StoreInt64(&sendAt[seq%ring], time.Now().UnixNano())
+		if writeFrame(nc, movePayload(seq, 1, 0)) != nil {
+			return
+		}
+		atomic.AddUint64(&movesSent, 1)
+	}
+}
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:9000", "server address")
+	conns := flag.Int("conns", 1000, "concurrent connections (players)")
+	roomSize := flag.Int("room-size", 50, "players per room")
+	rate := flag.Int("rate", 20, "moves/sec per connection")
+	dur := flag.Duration("dur", 30*time.Second, "measured duration")
+	warm := flag.Duration("warmup", 5*time.Second, "warmup (not measured)")
+	jsonOut := flag.Bool("json", false, "emit one JSON metrics object to stdout (logs stay on stderr)")
+	flag.Parse()
+
+	h := &Hist{}
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < *conns; i++ {
+		wg.Add(1)
+		room := uint32(i / *roomSize)
+		go runConn(*addr, room, *rate, *dur, *warm, h, &wg, start)
+		if i%200 == 199 {
+			time.Sleep(5 * time.Millisecond) // avoid a connect thundering herd
+		}
+	}
+	wg.Wait()
+
+	secs := time.Since(start).Seconds()
+	ms := atomic.LoadUint64(&movesSent)
+	sn := atomic.LoadUint64(&snapsRecv)
+	me := atomic.LoadUint64(&measured)
+	// Human-readable log lines always go to stderr (log package default).
+	log.Printf("conns=%d moves=%d snaps=%d measured=%d", *conns, ms, sn, me)
+	log.Printf("throughput: moves=%.0f/s snaps=%.0f/s", float64(ms)/secs, float64(sn)/secs)
+	log.Printf("latency ms: p50=%.2f p90=%.2f p99=%.2f p99.9=%.2f max=%.2f",
+		h.percentile(0.50)/1000, h.percentile(0.90)/1000, h.percentile(0.99)/1000,
+		h.percentile(0.999)/1000, h.percentile(1.0)/1000)
+
+	if *jsonOut {
+		out := map[string]any{
+			"conns":       *conns,
+			"moves_sent":  ms,
+			"snaps_recv":  sn,
+			"measured":    me,
+			"moves_per_s": float64(ms) / secs,
+			"snaps_per_s": float64(sn) / secs,
+			"p50_ms":      h.percentile(0.50) / 1000,
+			"p90_ms":      h.percentile(0.90) / 1000,
+			"p99_ms":      h.percentile(0.99) / 1000,
+			"p999_ms":     h.percentile(0.999) / 1000,
+			"max_ms":      h.percentile(1.0) / 1000,
+		}
+		b, _ := json.Marshal(out)
+		fmt.Println(string(b)) // machine-readable, on stdout
+	}
+}

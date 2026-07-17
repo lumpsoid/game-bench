@@ -1,0 +1,11 @@
+[package]
+name = "server-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
