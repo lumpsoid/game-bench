@@ -69,6 +69,14 @@ def spec_ocaml(port, tick, cores):
     return [(argv, {}, cpuspec(cores))]
 
 
+def spec_odin(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/odin/server-odin")
+    # One process, N worker threads (thread-per-core sharded reactor), pinned to
+    # all server cores — SO_REUSEPORT lets the kernel load-balance across workers.
+    argv = [exe, "-addr", f":{port}", "-tick", str(tick), "-workers", str(len(cores))]
+    return [(argv, {}, cpuspec(cores))]
+
+
 def spec_elixir(port, tick, cores):
     script = os.path.join(ROOT, "servers/elixir/server.exs")
     n = len(cores)
@@ -90,6 +98,7 @@ SERVERS = {
     "go":     {"build": (["go", "build", "-o", "gosrv", "."], "servers/go"),               "spec": spec_go},
     "rust":   {"build": (["cargo", "build", "--release"], "servers/rust"),                  "spec": spec_rust},
     "ocaml":  {"build": (["opam", "exec", "--", "dune", "build", "--profile", "release"], "servers/ocaml"), "spec": spec_ocaml},
+    "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
     "elixir": {"build": None,                                                                "spec": spec_elixir},
     "python": {"build": None,                                                                "spec": spec_python},
 }
@@ -286,7 +295,7 @@ def main():
     ncpu = os.cpu_count()
     half = ncpu // 2
     ap = argparse.ArgumentParser()
-    ap.add_argument("--servers", default="go,rust,ocaml,elixir,python")
+    ap.add_argument("--servers", default="go,rust,ocaml,odin,elixir,python")
     ap.add_argument("--conns", default="500,1000,2000,5000,10000")
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--room-size", type=int, default=50)

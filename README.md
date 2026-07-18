@@ -1,9 +1,9 @@
 # game-bench
 
-A realistic throughput/latency benchmark for request handling across five runtimes,
+A realistic throughput/latency benchmark for request handling across six runtimes,
 using a **mini authoritative game server** + an automated **load-generator client**.
 
-Servers to compare: **Go, Rust, OCaml, Elixir (bare BEAM), Python.**
+Servers to compare: **Go, Rust, OCaml, Odin, Elixir (bare BEAM), Python.**
 Wire protocol: raw TCP, `u32` length-prefixed frames — see [PROTOCOL.md](PROTOCOL.md).
 Fairness rules: see [METHODOLOGY.md](METHODOLOGY.md).
 
@@ -15,7 +15,7 @@ METHODOLOGY.md       fairness rules + how to read results
 loadgen/             the ONE automated client (Go), open-loop, built-in histogram
 servers/
   go/     <- reference server, DONE + smoke-tested
-  rust/   ocaml/  elixir/  python/   <- to port from the spec
+  rust/   ocaml/  odin/  elixir/  python/   <- ported from the spec
 runner/              orchestration (build, pin cores, ramp, sample RSS/CPU) — TODO
 results/             raw output + plots
 ```
@@ -35,7 +35,14 @@ results/             raw output + plots
       0.84 cores / 30k moves/s (p50 86ms, saturated) vs domains=8 used 3.59 cores /
       117k moves/s (p50 18ms). Ceiling is the central tick loop + per-room mutex
       (single-domain serialization); see header in `main.ml`.
-- [x] `runner/` orchestration + RSS/CPU sampling — `runner/run.py`, validated on all 5
+- [x] **Odin** server (`servers/odin`, raw epoll) — built + smoke-tested.
+      No green threads/async runtime, so it uses a **thread-per-core sharded
+      reactor**: `-workers N` independent single-threaded epoll loops, each owning
+      its own connections and rooms (no locks on game state), with the listener
+      opened per worker via `SO_REUSEPORT` so the kernel load-balances accepts.
+      Same shard-the-rooms multi-core model as the Python server, but with OS
+      threads instead of processes. Idle RSS is tiny (~3 MB). See header in `main.odin`.
+- [x] `runner/` orchestration + RSS/CPU sampling — `runner/run.py`, validated on all 6
 - [x] plots — `runner/plot.py` renders `results.csv` into a self-contained,
       theme-aware HTML report of saturation curves (no deps)
 
@@ -45,7 +52,7 @@ results/             raw output + plots
 ulimit -n 100000
 eval $(opam env)          # so the runner can build the OCaml server
 python3 runner/run.py \
-    --servers go,rust,ocaml,elixir,python \
+    --servers go,rust,ocaml,odin,elixir,python \
     --conns 500,1000,2000,5000,10000 \
     --trials 3 --dur 20 --warmup 5
 ```
@@ -55,7 +62,8 @@ The runner (stdlib Python, no deps) runs ONE server at a time and, for each
 - pins the server to the **server cores** and the loadgen to disjoint **client
   cores** (`taskset`) so the client can never steal the server's CPU;
 - sets each runtime's parallelism to the core budget (`GOMAXPROCS` /
-  `TOKIO_WORKER_THREADS` / `-domains` / `+S N:N` / N python procs via SO_REUSEPORT);
+  `TOKIO_WORKER_THREADS` / `-domains` / `-workers` / `+S N:N` / N python procs via
+  SO_REUSEPORT);
 - waits for the port to actually accept (no blind sleeps);
 - samples server RSS + CPU from `/proc` (by process group, so BEAM's children count);
 - writes one CSV row to `results/results.csv`.
@@ -91,8 +99,12 @@ ramp (see METHODOLOGY.md), which the `runner/` will drive.
 ./servers/rust/target/release/server-rust  -addr :9000 -tick 30
 elixir servers/elixir/server.exs      -addr :9000 -tick 30
 python3 servers/python/server.py      -addr :9000 -tick 30
+./servers/odin/server-odin            -addr :9000 -tick 30 -workers 4   # odin build . -out:server-odin -o:speed first
 # ocaml: dune build --profile release && ./_build/default/main.exe -addr :9000 -tick 30
 ```
+
+Odin takes `-workers N` (default 1) to set its core budget, the way the others
+take `GOMAXPROCS` / `-domains` / `+S`; the runner passes `-workers = #server cores`.
 
 ## Quick start (single box, smoke test)
 

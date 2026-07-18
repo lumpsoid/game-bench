@@ -1,2 +1,4 @@
 /servers/ocaml/_build
 /servers/rust/target
+/servers/odin/server-odin
+runner/__pycache__/
