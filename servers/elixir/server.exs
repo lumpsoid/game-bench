@@ -1,52 +1,55 @@
-# Game server (Elixir / bare BEAM, no Phoenix). Mirrors the reference architecture:
-#   - one BEAM process per connection (owns the socket = its own write path)
-#   - one GenServer per room that OWNS its state; all mutation via cast/call
-#   - a slow client's process can't stall the room: the room only send()s to it
-# Uses OTP's {packet, 4} framing (4-byte big-endian length prefix), the idiomatic
-# equivalent of the manual length prefix in the Go/Rust servers.
+# Game server (Elixir / bare BEAM, no Phoenix) — idiomatic OTP edition.
+#
+# This is what an Elixir team would actually ship: standard libraries, no
+# hand-rolled socket loops or optimizations.
+#   - Thousand Island: the acceptor pool + per-connection handler process
+#     (the same library that powers Bandit/Phoenix). It owns the accept loop,
+#     connection supervision, and socket flow control.
+#   - Registry + DynamicSupervisor: room lookup and on-demand, race-safe room
+#     creation — the canonical "process registry" pattern.
+#   - one GenServer per room that OWNS its state; all mutation via cast/call.
+#   - one handler process per connection that OWNS its socket (its write path);
+#     a slow client can't stall the room — the room only send()s to it.
+# OTP {packet, 4} framing (4-byte big-endian length prefix) matches the other
+# servers. See ../../PROTOCOL.md.
 #
 # Run:  elixir server.exs -addr :9000 -tick 30
 #       elixir --erl "+S 4:4" server.exs -addr :9000   # pin schedulers for fairness
-# See ../../PROTOCOL.md. (Thousand Island could replace the acceptor pool below.)
-
-defmodule PidGen do
-  import Bitwise
-  def init, do: :persistent_term.put({PidGen, :ref}, :atomics.new(1, signed: false))
-  def next do
-    ref = :persistent_term.get({PidGen, :ref})
-    :atomics.add_get(ref, 1, 1) |> band(0xFFFFFFFF)
-  end
-end
+Mix.install([{:thousand_island, "~> 1.3"}])
 
 defmodule Room do
+  # One GenServer per room. Owns all player state; mutated only via cast/call.
   use GenServer
 
-  def start(tick_ms), do: GenServer.start(__MODULE__, tick_ms)
+  def start_link(room_id), do: GenServer.start_link(__MODULE__, room_id, name: via(room_id))
+  defp via(id), do: {:via, Registry, {RoomRegistry, id}}
 
   @impl true
-  def init(tick_ms) do
+  def init(_room_id) do
+    tick_ms = :persistent_term.get(:tick_ms)
     Process.send_after(self(), :tick, tick_ms)
-    {:ok, %{tick_ms: tick_ms, tick_no: 0, players: %{}, conns: %{}, mons: %{}}}
+    {:ok, %{tick_ms: tick_ms, tick_no: 0, players: %{}, conns: %{}, mons: %{}, next_id: 1}}
   end
 
   @impl true
   def handle_call({:join, conn_pid}, _from, s) do
-    pid = PidGen.next()
+    id = s.next_id
     ref = Process.monitor(conn_pid)
     s = %{
       s
-      | players: Map.put(s.players, pid, %{x: 0, y: 0, vx: 0, vy: 0, last_seq: 0}),
-        conns: Map.put(s.conns, pid, conn_pid),
-        mons: Map.put(s.mons, ref, pid)
+      | players: Map.put(s.players, id, %{x: 0, y: 0, vx: 0, vy: 0, last_seq: 0}),
+        conns: Map.put(s.conns, id, conn_pid),
+        mons: Map.put(s.mons, ref, id),
+        next_id: id + 1
     }
-    {:reply, pid, s}
+    {:reply, id, s}
   end
 
   @impl true
-  def handle_cast({:move, pid, seq, dx, dy}, s) do
+  def handle_cast({:move, id, seq, dx, dy}, s) do
     case s.players do
-      %{^pid => p} ->
-        {:noreply, %{s | players: %{s.players | pid => %{p | vx: dx, vy: dy, last_seq: seq}}}}
+      %{^id => p} ->
+        {:noreply, %{s | players: %{s.players | id => %{p | vx: dx, vy: dy, last_seq: seq}}}}
       _ ->
         {:noreply, s}
     end
@@ -66,7 +69,7 @@ defmodule Room do
       end
 
     payload = <<0x82, tick_no::32, n::16, entries::binary>>
-    for {_id, cpid} <- s.conns, do: send(cpid, {:snapshot, payload})
+    for {_id, pid} <- s.conns, do: send(pid, {:snapshot, payload})
     {:noreply, %{s | tick_no: tick_no, players: players}}
   end
 
@@ -75,176 +78,55 @@ defmodule Room do
     case Map.pop(s.mons, ref) do
       {nil, _} ->
         {:noreply, s}
-      {pid, mons} ->
-        {:noreply, %{s | players: Map.delete(s.players, pid), conns: Map.delete(s.conns, pid), mons: mons}}
+      {id, mons} ->
+        {:noreply, %{s | players: Map.delete(s.players, id), conns: Map.delete(s.conns, id), mons: mons}}
     end
   end
-end
-
-defmodule Rooms do
-  use GenServer
-
-  def start_link(tick_ms), do: GenServer.start_link(__MODULE__, tick_ms, name: __MODULE__)
-  def get(room_id), do: GenServer.call(__MODULE__, {:get, room_id})
-
-  @impl true
-  def init(tick_ms) do
-    :ets.new(:rooms, [:named_table, :set, :protected, read_concurrency: true])
-    {:ok, %{tick_ms: tick_ms}}
-  end
-
-  @impl true
-  def handle_call({:get, room_id}, _from, s) do
-    pid =
-      case :ets.lookup(:rooms, room_id) do
-        [{^room_id, p}] ->
-          p
-        [] ->
-          {:ok, p} = Room.start(s.tick_ms)
-          :ets.insert(:rooms, {room_id, p})
-          p
-      end
-    {:reply, pid, s}
-  end
-end
-
-defmodule Stats do
-  # DIAG-only counters: 1=join_ok, 2=join_fail
-  def init, do: :persistent_term.put({Stats, :ref}, :atomics.new(4, signed: false))
-  def inc(slot), do: :atomics.add(:persistent_term.get({Stats, :ref}), slot, 1)
-  def get(slot), do: :atomics.get(:persistent_term.get({Stats, :ref}), slot)
 end
 
 defmodule Conn do
-  @diag System.get_env("DIAG") != nil
+  # One handler process per connection (Thousand Island manages the lifecycle).
+  # It owns the socket, so it's the only process that writes to this client.
+  use ThousandIsland.Handler
 
-  def start(socket) do
-    :inet.setopts(socket, [:binary, packet: 4, nodelay: true, active: :once])
-    loop(socket, nil, nil)
+  @impl ThousandIsland.Handler
+  def handle_connection(_socket, _state), do: {:continue, %{room: nil, id: nil}}
+
+  @impl ThousandIsland.Handler
+  def handle_data(<<0x01, room_id::32>>, socket, state) do
+    room = room_pid(room_id)
+    id = GenServer.call(room, {:join, self()})
+    ThousandIsland.Socket.send(socket, <<0x81, id::32, room_id::32>>)
+    {:continue, %{state | room: room, id: id}}
   end
 
-  defp loop(socket, room, my_pid) do
-    receive do
-      {:tcp, ^socket, <<0x01, room_id::32>>} ->
-        room = Rooms.get(room_id)
-        pid =
-          if @diag do
-            try do
-              r = GenServer.call(room, {:join, self()})
-              Stats.inc(1)
-              r
-            catch
-              :exit, _ -> Stats.inc(2); exit(:normal)
-            end
-          else
-            GenServer.call(room, {:join, self()})
-          end
-        :gen_tcp.send(socket, <<0x81, pid::32, room_id::32>>)
-        :inet.setopts(socket, active: :once)
-        loop(socket, room, pid)
-
-      {:tcp, ^socket, <<0x02, seq::32, dx::signed-16, dy::signed-16>>} ->
-        if room, do: GenServer.cast(room, {:move, my_pid, seq, dx, dy})
-        :inet.setopts(socket, active: :once)
-        loop(socket, room, my_pid)
-
-      {:tcp, ^socket, _other} ->
-        :inet.setopts(socket, active: :once)
-        loop(socket, room, my_pid)
-
-      {:snapshot, bin} ->
-        # Shed load like the Go/Rust/OCaml servers do, but better: if this client
-        # has fallen behind and several snapshots are queued, drop the stale ones
-        # and send only the freshest state. Bounds latency under overload.
-        :gen_tcp.send(socket, drain_snapshots(bin))
-        loop(socket, room, my_pid)
-
-      {:tcp_closed, ^socket} ->
-        :ok
-
-      {:tcp_error, ^socket, _} ->
-        :ok
-    end
+  def handle_data(<<0x02, seq::32, dx::signed-16, dy::signed-16>>, _socket, %{room: room, id: id} = state)
+      when room != nil do
+    GenServer.cast(room, {:move, id, seq, dx, dy})
+    {:continue, state}
   end
 
-  # Non-blocking: keep the newest snapshot, discard any older ones already queued.
-  defp drain_snapshots(cur) do
-    receive do
-      {:snapshot, newer} -> drain_snapshots(newer)
-    after
-      0 -> cur
-    end
-  end
-end
+  def handle_data(_other, _socket, state), do: {:continue, state}
 
-defmodule Server do
-  @diag System.get_env("DIAG") != nil
-
-  def start(port, acceptors) do
-    {:ok, lsock} =
-      :gen_tcp.listen(port, [
-        :binary,
-        packet: 4,
-        active: false,
-        reuseaddr: true,
-        nodelay: true,
-        backlog: 4096
-      ])
-
-    for _ <- 1..acceptors, do: spawn(fn -> accept_loop(lsock) end)
-    lsock
+  # Snapshots pushed by the room arrive as normal messages; the handler is a
+  # GenServer, so we handle them and write to our socket. State is {socket, state}.
+  @impl GenServer
+  def handle_info({:snapshot, bin}, {socket, state}) do
+    ThousandIsland.Socket.send(socket, bin)
+    {:noreply, {socket, state}}
   end
 
-  defp accept_loop(lsock) do
-    case :gen_tcp.accept(lsock) do
-      {:ok, sock} ->
-        if @diag, do: Stats.inc(3)
-        pid = spawn(fn ->
-          receive do
-            :go -> Conn.start(sock)
-          end
-        end)
-        # Robust: a client that reset between accept and here makes
-        # controlling_process return {:error,_}. The old `:ok = ...` match RAISED,
-        # which killed this acceptor for good (no supervisor) — a few resets took
-        # out all acceptors and accepts stopped. Handle it instead of crashing.
-        case :gen_tcp.controlling_process(sock, pid) do
-          :ok ->
-            send(pid, :go)
-          {:error, _} ->
-            if @diag, do: Stats.inc(4)
-            :gen_tcp.close(sock)
-            Process.exit(pid, :kill)
+  # Canonical Registry + DynamicSupervisor lookup-or-start (race-safe).
+  defp room_pid(room_id) do
+    case Registry.lookup(RoomRegistry, room_id) do
+      [{pid, _}] ->
+        pid
+      [] ->
+        case DynamicSupervisor.start_child(RoomSup, {Room, room_id}) do
+          {:ok, pid} -> pid
+          {:error, {:already_started, pid}} -> pid
         end
-        accept_loop(lsock)
-
-      _ ->
-        accept_loop(lsock)
     end
-  end
-end
-
-defmodule Diag do
-  # Gated on DIAG=1. Prints establishment progress + backpressure signals to stderr.
-  def start, do: spawn(fn -> loop(0) end)
-
-  defp loop(n) do
-    Process.sleep(1000)
-    procs = :erlang.system_info(:process_count)
-    mem = div(:erlang.memory(:total), 1024 * 1024)
-    maxq =
-      Process.list()
-      |> Enum.reduce(0, fn p, mx ->
-        case Process.info(p, :message_queue_len) do
-          {:message_queue_len, q} when q > mx -> q
-          _ -> mx
-        end
-      end)
-    rq = :erlang.statistics(:run_queue)
-    IO.puts(:stderr, "DIAG t=#{n + 1}s procs=#{procs} mem=#{mem}MB max_mailbox=#{maxq} " <>
-      "run_queue=#{rq} accepts=#{Stats.get(3)} cp_fail=#{Stats.get(4)} " <>
-      "join_ok=#{Stats.get(1)} join_fail=#{Stats.get(2)}")
-    loop(n + 1)
   end
 end
 
@@ -261,15 +143,19 @@ end
 
 {port, tick_hz} = Args.parse(System.argv())
 tick_ms = max(1, div(1000, tick_hz))
+:persistent_term.put(:tick_ms, tick_ms)
 
-PidGen.init()
-if System.get_env("DIAG"), do: Stats.init()
-{:ok, _} = Rooms.start_link(tick_ms)
-# A POOL of acceptors (like ranch/Thousand Island), not one-per-scheduler. Four
-# acceptors cannot drain a 10k connection burst; the backlog overflows and
-# connections are refused. Default 100; override with ACCEPTORS=N.
-acceptors = String.to_integer(System.get_env("ACCEPTORS") || "100")
-Server.start(port, acceptors)
-IO.puts("elixir game server on :#{port}, tick=#{tick_hz}Hz (#{tick_ms}ms), schedulers=#{System.schedulers_online()}")
-if System.get_env("DIAG"), do: Diag.start()
+children = [
+  {Registry, keys: :unique, name: RoomRegistry},
+  {DynamicSupervisor, name: RoomSup, strategy: :one_for_one},
+  {ThousandIsland,
+   port: port,
+   handler_module: Conn,
+   num_acceptors: 100,
+   transport_options: [packet: 4, nodelay: true, backlog: 4096]}
+]
+
+{:ok, _} = Supervisor.start_link(children, strategy: :one_for_one)
+IO.puts("elixir game server on :#{port}, tick=#{tick_hz}Hz (#{tick_ms}ms), " <>
+  "schedulers=#{System.schedulers_online()}")
 Process.sleep(:infinity)
