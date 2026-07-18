@@ -3,3 +3,5 @@
 /servers/odin/server-odin
 runner/__pycache__/
 /results
+/loadgen/loadgen
+/servers/go/gosrv
