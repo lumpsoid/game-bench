@@ -11,13 +11,17 @@ Curves (x = offered load in connections, one line per server, median over trials
   - peak RSS under load
   - CPU cores used
 
+Charts render client-side from embedded data: click a server in the legend to
+hide it. Hiding rescales every y-axis to the remaining servers, so one blown-out
+result can't flatten the curves you actually care about.
+
 Identity is never color-alone: every line is direct-labelled and a full data
 table is included (the palette's low-contrast light slots require this relief).
 """
 
 import argparse
 import csv
-import math
+import json
 import os
 import statistics
 from collections import defaultdict
@@ -26,29 +30,21 @@ from collections import defaultdict
 SLOT = {"go": 1, "rust": 2, "ocaml": 3, "elixir": 4, "python": 5}
 ORDER = ["go", "rust", "ocaml", "elixir", "python"]
 
-# Charts: (csv_field, title, y-axis label, value formatter)
+# Charts: (csv_field, title, y-axis label, python formatter, js format spec).
+# The js spec {"d": decimals, "c": thousands-comma} mirrors the python formatter
+# so client-side axis ticks / tooltips render identically.
 CHARTS = [
-    ("moves_per_s", "Throughput (processed)", "moves / s", lambda v: f"{v:,.0f}"),
-    ("p99_ms", "Latency p99", "ms", lambda v: f"{v:.1f}"),
-    ("p50_ms", "Latency p50", "ms", lambda v: f"{v:.1f}"),
-    ("rss_peak_mb", "Peak memory under load", "MB (RSS)", lambda v: f"{v:.1f}"),
-    ("cpu_cores", "CPU cores used", "cores", lambda v: f"{v:.2f}"),
+    ("moves_per_s", "Throughput (processed)", "moves / s", lambda v: f"{v:,.0f}", {"d": 0, "c": True}),
+    ("p99_ms", "Latency p99", "ms", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
+    ("p50_ms", "Latency p50", "ms", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
+    ("rss_peak_mb", "Peak memory under load", "MB (RSS)", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
+    ("cpu_cores", "CPU cores used", "cores", lambda v: f"{v:.2f}", {"d": 2, "c": False}),
 ]
 
-# Plot geometry
+# Plot geometry (shared with the client-side renderer via GEOM).
 W, H = 900, 360
 ML, MR, MT, MB = 72, 128, 40, 52
-X0, X1 = ML, W - MR
-Y0, Y1 = H - MB, MT
-
-
-def nice_max(v):
-    if v <= 0:
-        return 1.0
-    exp = math.floor(math.log10(v))
-    f = v / 10 ** exp
-    nf = 1 if f <= 1 else 2 if f <= 2 else 5 if f <= 5 else 10
-    return nf * 10 ** exp
+GEOM = {"W": W, "H": H, "ML": ML, "MR": MR, "MT": MT, "MB": MB}
 
 
 def load(path):
@@ -69,87 +65,31 @@ def load(path):
     return data, present, sorted(conns)
 
 
-def xpos(i, n):
-    return X0 if n <= 1 else X0 + (X1 - X0) * i / (n - 1)
-
-
 def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def chart_svg(field, title, ylabel, fmt, data, servers, all_conns):
-    n = len(all_conns)
-    xi = {c: i for i, c in enumerate(all_conns)}
-
-    series = {}
-    vmax = 0.0
-    for s in servers:
-        pts = []
-        for c in all_conns:
-            vals = data[field].get(s, {}).get(c)
-            if vals:
-                m = statistics.median(vals)
-                pts.append((c, m))
-                vmax = max(vmax, m)
-        if pts:
-            series[s] = pts
-    ymax = nice_max(vmax) if vmax > 0 else 1.0
-
-    def X(c):
-        return xpos(xi[c], n)
-
-    def Y(v):
-        return Y0 - (Y0 - Y1) * (v / ymax)
-
-    parts = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" '
-             f'aria-label="{esc(title)}" preserveAspectRatio="xMidYMid meet">']
-    parts.append(f'<text x="{ML}" y="24" class="c-title">{esc(title)}</text>')
-
-    # y gridlines + ticks (5 steps)
-    for k in range(6):
-        v = ymax * k / 5
-        y = Y(v)
-        parts.append(f'<line x1="{X0}" y1="{y:.1f}" x2="{X1}" y2="{y:.1f}" class="grid"/>')
-        parts.append(f'<text x="{X0-10}" y="{y+4:.1f}" class="tick tick-y">{fmt(v)}</text>')
-    parts.append(f'<text class="axis-label" transform="translate(18,{(Y0+Y1)/2}) rotate(-90)">{esc(ylabel)}</text>')
-
-    # x ticks
-    for c in all_conns:
-        x = X(c)
-        parts.append(f'<text x="{x:.1f}" y="{Y0+22}" class="tick tick-x">{c:,}</text>')
-    parts.append(f'<text x="{(X0+X1)/2}" y="{H-8}" class="axis-label">connections (offered load)</text>')
-
-    # baseline
-    parts.append(f'<line x1="{X0}" y1="{Y0}" x2="{X1}" y2="{Y0}" class="baseline"/>')
-
-    # series lines + markers + direct labels
-    for s in servers:
-        if s not in series:
-            continue
-        slot = SLOT.get(s, 1)
-        col = f"var(--series-{slot})"
-        pts = series[s]
-        d = " ".join(f"{'M' if i==0 else 'L'}{X(c):.1f},{Y(v):.1f}" for i, (c, v) in enumerate(pts))
-        parts.append(f'<path d="{d}" fill="none" stroke="{col}" stroke-width="2" '
-                     f'stroke-linejoin="round" stroke-linecap="round"/>')
-        for c, v in pts:
-            parts.append(f'<circle cx="{X(c):.1f}" cy="{Y(v):.1f}" r="4" fill="{col}" '
-                         f'stroke="var(--surface-1)" stroke-width="1.5">'
-                         f'<title>{esc(s)} @ {c:,} conns: {fmt(v)} {esc(ylabel)}</title></circle>')
-        # direct label: colored dot + server name in ink, at the last point
-        lc, lv = pts[-1]
-        ly = Y(lv)
-        parts.append(f'<circle cx="{X1+14}" cy="{ly:.1f}" r="4" fill="{col}"/>')
-        parts.append(f'<text x="{X1+24}" y="{ly+4:.1f}" class="direct-label">{esc(s)}</text>')
-
-    parts.append("</svg>")
-    return "".join(parts)
+def series_json(data, servers, all_conns):
+    """field -> server -> [[conns, median], ...] (medians precomputed)."""
+    out = {}
+    for field, *_ in CHARTS:
+        by_server = {}
+        for s in servers:
+            pts = []
+            for c in all_conns:
+                vals = data[field].get(s, {}).get(c)
+                if vals:
+                    pts.append([c, statistics.median(vals)])
+            if pts:
+                by_server[s] = pts
+        out[field] = by_server
+    return out
 
 
 def table_html(data, servers, all_conns):
-    fields = [f for f, *_ in CHARTS]
-    fmts = {f: fmt for f, _, _, fmt in CHARTS}
-    heads = "".join(f"<th>{esc(t)}</th>" for _, t, _, _ in CHARTS)
+    fields = [c[0] for c in CHARTS]
+    fmts = {c[0]: c[3] for c in CHARTS}
+    heads = "".join(f"<th>{esc(c[1])}</th>" for c in CHARTS)
     rows = []
     for s in servers:
         for c in all_conns:
@@ -164,16 +104,20 @@ def table_html(data, servers, all_conns):
                     cells.append("<td>–</td>")
             if any_val:
                 dot = f'<span class="sw" style="background:var(--series-{SLOT.get(s,1)})"></span>'
-                rows.append(f"<tr><td>{dot}{esc(s)}</td><td>{c:,}</td>{''.join(cells)}</tr>")
+                rows.append(f'<tr data-server="{esc(s)}"><td>{dot}{esc(s)}</td>'
+                            f"<td>{c:,}</td>{''.join(cells)}</tr>")
     return (f'<table><thead><tr><th>server</th><th>conns</th>{heads}</tr></thead>'
             f'<tbody>{"".join(rows)}</tbody></table>')
 
 
 def legend_html(servers):
     items = "".join(
-        f'<span class="leg"><span class="sw" style="background:var(--series-{SLOT.get(s,1)})"></span>{esc(s)}</span>'
+        f'<button type="button" class="leg" data-server="{esc(s)}" aria-pressed="true">'
+        f'<span class="sw" style="background:var(--series-{SLOT.get(s,1)})"></span>'
+        f'<span class="leg-name">{esc(s)}</span></button>'
         for s in servers)
-    return f'<div class="legend">{items}</div>'
+    return (f'<div class="legend" id="legend">{items}'
+            f'<button type="button" class="leg leg-all" id="show-all" hidden>show all</button></div>')
 
 
 CSS = """
@@ -202,31 +146,184 @@ h1{font-size:22px;margin:0 0 4px} .sub{color:var(--ink2);margin:0 0 24px;font-si
 .tick-y{text-anchor:end} .tick-x{text-anchor:middle}
 .axis-label{fill:var(--ink2);font-size:12px;text-anchor:middle}
 .direct-label{fill:var(--ink2);font-size:12px;font-weight:500}
-.legend{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 20px}
-.leg,.sw{display:inline-flex;align-items:center}
-.leg{gap:6px;color:var(--ink2);font-size:13px}
-.sw{width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:middle}
+.legend{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 20px;align-items:center}
+.leg{display:inline-flex;align-items:center;gap:6px;color:var(--ink2);font-size:13px;
+  background:transparent;border:1px solid var(--border);border-radius:999px;
+  padding:4px 12px 4px 8px;cursor:pointer;font-family:inherit;line-height:1;
+  transition:opacity .12s,border-color .12s}
+.leg:hover{border-color:var(--axis)}
+.leg[aria-pressed="false"]{opacity:.42}
+.leg[aria-pressed="false"] .leg-name{text-decoration:line-through}
+.leg[aria-pressed="false"] .sw{opacity:.5}
+.leg-all{color:var(--ink2);padding:4px 12px}
+.sw{width:11px;height:11px;border-radius:3px;flex:none}
+tr.dim{opacity:.32}
 table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
 th,td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--grid)}
 th:first-child,td:first-child{text-align:left} th{color:var(--ink2);font-weight:600}
 th:nth-child(2),td:nth-child(2){text-align:right}
+td .sw{display:inline-block;margin-right:6px;vertical-align:middle}
 details{margin-top:8px} summary{cursor:pointer;color:var(--ink2);font-size:14px;padding:8px 0}
+.noscript{color:var(--ink2);font-size:13px;margin:0 0 16px}
+"""
+
+# Client-side renderer. Mirrors the former server-side SVG builder, but driven by
+# a `hidden` set so hiding a server rescales every axis to what remains.
+JS = r"""
+(function(){
+  var CFG = __CFG__;
+  var G = CFG.geom;
+  var X0 = G.ML, X1 = G.W - G.MR, Y0 = G.H - G.MB, Y1 = G.MT;
+  var conns = CFG.conns;
+  var xi = {}; conns.forEach(function(c,i){ xi[c] = i; });
+  var hidden = Object.create(null);
+
+  function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  function niceMax(v){
+    if(v<=0) return 1;
+    var exp = Math.floor(Math.log10(v));
+    var f = v / Math.pow(10,exp);
+    var nf = f<=1?1 : f<=2?2 : f<=5?5 : 10;
+    return nf * Math.pow(10,exp);
+  }
+  function fmt(v, spec){
+    var s = Number(v).toFixed(spec.d);
+    if(spec.c){
+      var p = s.split(".");
+      p[0] = p[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+      s = p.join(".");
+    }
+    return s;
+  }
+  function xpos(i,n){ return n<=1 ? X0 : X0 + (X1-X0)*i/(n-1); }
+
+  function render(chart){
+    var svg = [];
+    var n = conns.length;
+    var byServer = CFG.series[chart.field] || {};
+    var spec = chart.spec, ylabel = chart.ylabel;
+
+    // visible series + shared max
+    var vmax = 0, visible = [];
+    CFG.servers.forEach(function(s){
+      if(hidden[s]) return;
+      var pts = byServer[s];
+      if(!pts || !pts.length) return;
+      visible.push(s);
+      pts.forEach(function(p){ if(p[1] > vmax) vmax = p[1]; });
+    });
+    var ymax = vmax > 0 ? niceMax(vmax) : 1;
+
+    function X(c){ return xpos(xi[c], n); }
+    function Y(v){ return Y0 - (Y0 - Y1) * (v / ymax); }
+
+    svg.push('<svg viewBox="0 0 '+G.W+' '+G.H+'" class="chart" role="img" aria-label="'
+      + esc(chart.title) + '" preserveAspectRatio="xMidYMid meet">');
+    svg.push('<text x="'+G.ML+'" y="24" class="c-title">'+esc(chart.title)+'</text>');
+
+    for(var k=0;k<=5;k++){
+      var v = ymax*k/5, y = Y(v);
+      svg.push('<line x1="'+X0+'" y1="'+y.toFixed(1)+'" x2="'+X1+'" y2="'+y.toFixed(1)+'" class="grid"/>');
+      svg.push('<text x="'+(X0-10)+'" y="'+(y+4).toFixed(1)+'" class="tick tick-y">'+fmt(v,spec)+'</text>');
+    }
+    svg.push('<text class="axis-label" transform="translate(18,'+((Y0+Y1)/2)+') rotate(-90)">'+esc(ylabel)+'</text>');
+
+    conns.forEach(function(c){
+      svg.push('<text x="'+X(c).toFixed(1)+'" y="'+(Y0+22)+'" class="tick tick-x">'+fmt(c,{d:0,c:true})+'</text>');
+    });
+    svg.push('<text x="'+((X0+X1)/2)+'" y="'+(G.H-8)+'" class="axis-label">connections (offered load)</text>');
+    svg.push('<line x1="'+X0+'" y1="'+Y0+'" x2="'+X1+'" y2="'+Y0+'" class="baseline"/>');
+
+    visible.forEach(function(s){
+      var col = "var(--series-" + (CFG.slot[s]||1) + ")";
+      var pts = byServer[s];
+      var d = pts.map(function(p,i){ return (i===0?"M":"L") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1); }).join(" ");
+      svg.push('<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>');
+      pts.forEach(function(p){
+        svg.push('<circle cx="'+X(p[0]).toFixed(1)+'" cy="'+Y(p[1]).toFixed(1)+'" r="4" fill="'+col
+          +'" stroke="var(--surface-1)" stroke-width="1.5"><title>'+esc(s)+' @ '+fmt(p[0],{d:0,c:true})
+          +' conns: '+fmt(p[1],spec)+' '+esc(ylabel)+'</title></circle>');
+      });
+      var last = pts[pts.length-1], ly = Y(last[1]);
+      svg.push('<circle cx="'+(X1+14)+'" cy="'+ly.toFixed(1)+'" r="4" fill="'+col+'"/>');
+      svg.push('<text x="'+(X1+24)+'" y="'+(ly+4).toFixed(1)+'" class="direct-label">'+esc(s)+'</text>');
+    });
+
+    svg.push('</svg>');
+    return svg.join("");
+  }
+
+  function renderAll(){
+    CFG.charts.forEach(function(chart, i){
+      var el = document.getElementById("chart-"+i);
+      if(el) el.innerHTML = render(chart);
+    });
+  }
+
+  function syncTable(){
+    var rows = document.querySelectorAll("tbody tr[data-server]");
+    for(var i=0;i<rows.length;i++){
+      rows[i].classList.toggle("dim", !!hidden[rows[i].getAttribute("data-server")]);
+    }
+  }
+
+  function refresh(){
+    var btns = document.querySelectorAll(".leg[data-server]");
+    for(var i=0;i<btns.length;i++){
+      var srv = btns[i].getAttribute("data-server");
+      btns[i].setAttribute("aria-pressed", hidden[srv] ? "false" : "true");
+    }
+    var showAll = document.getElementById("show-all");
+    if(showAll) showAll.hidden = Object.keys(hidden).length === 0;
+    renderAll();
+    syncTable();
+  }
+
+  var legend = document.getElementById("legend");
+  if(legend){
+    legend.addEventListener("click", function(e){
+      var btn = e.target.closest ? e.target.closest(".leg") : null;
+      if(!btn) return;
+      if(btn.id === "show-all"){ hidden = Object.create(null); refresh(); return; }
+      var s = btn.getAttribute("data-server");
+      if(!s) return;
+      if(hidden[s]) delete hidden[s]; else hidden[s] = true;
+      refresh();
+    });
+  }
+
+  renderAll();
+})();
 """
 
 
 def build_html(data, servers, all_conns, src):
-    charts = "".join(f'<div class="card">{chart_svg(f,t,y,fmt,data,servers,all_conns)}</div>'
-                     for f, t, y, fmt in CHARTS)
+    cfg = {
+        "geom": GEOM,
+        "conns": all_conns,
+        "servers": servers,
+        "slot": {s: SLOT.get(s, 1) for s in servers},
+        "series": series_json(data, servers, all_conns),
+        "charts": [{"field": f, "title": t, "ylabel": y, "spec": spec}
+                   for f, t, y, _fmt, spec in CHARTS],
+    }
+    js = JS.replace("__CFG__", json.dumps(cfg))
+    cards = "".join(f'<div class="card"><div id="chart-{i}"></div></div>'
+                    for i in range(len(CHARTS)))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>game-bench — saturation curves</title><style>{CSS}</style></head>
 <body><div class="wrap">
 <h1>Saturation curves</h1>
 <p class="sub">median over trials · x = offered load (connections) · source: {esc(os.path.basename(src))}</p>
+<p class="sub" style="margin-top:-16px">Click a server to hide it — the axes rescale to what's left.</p>
+<noscript><p class="noscript">This report needs JavaScript to draw the charts. The data table below is complete.</p></noscript>
 {legend_html(servers)}
-{charts}
+{cards}
 <details open><summary>Data table</summary><div class="card">{table_html(data,servers,all_conns)}</div></details>
-</div></body></html>"""
+</div>
+<script>{js}</script>
+</body></html>"""
 
 
 def main():
