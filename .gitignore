@@ -2,3 +2,4 @@
 /servers/rust/target
 /servers/odin/server-odin
 runner/__pycache__/
+/results
