@@ -18,6 +18,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -122,6 +123,19 @@ func stabilityStats(xs []float64) (worst, cv float64) {
 		ss += d * d
 	}
 	return worst, math.Sqrt(ss/float64(len(xs)-1)) / mean
+}
+
+// ---- self-instrumentation (is the loadgen itself the bottleneck?) ----
+
+func tvSec(tv syscall.Timeval) float64 { return float64(tv.Sec) + float64(tv.Usec)/1e6 }
+
+// selfCPUCores returns this process's CPU usage (all threads) in cores over wall.
+func selfCPUCores(wall float64) float64 {
+	var ru syscall.Rusage
+	if wall <= 0 || syscall.Getrusage(syscall.RUSAGE_SELF, &ru) != nil {
+		return 0
+	}
+	return (tvSec(ru.Utime) + tvSec(ru.Stime)) / wall
 }
 
 // ---- wire helpers ----
@@ -305,6 +319,17 @@ func main() {
 	log.Printf("latency stability: p99_worst_1s=%.2f ms p99_cv=%.3f (%d windows)",
 		p99Worst, p99CV, len(p99s))
 
+	// Loadgen self-checks: if the client is CPU-bound or can't keep its send
+	// schedule, the latency above measures the client, not the server.
+	clientCPU := selfCPUCores(secs)
+	sendTarget := float64(*conns) * float64(*rate) * (*warm + *dur).Seconds()
+	sendRatePct := 100.0
+	if sendTarget > 0 {
+		sendRatePct = 100.0 * float64(ms) / sendTarget
+	}
+	log.Printf("loadgen self-check: client_cpu=%.2f cores  send_rate=%.1f%% of target",
+		clientCPU, sendRatePct)
+
 	if *jsonOut {
 		out := map[string]any{
 			"conns":       *conns,
@@ -322,6 +347,9 @@ func main() {
 			"p99_worst_1s_ms": p99Worst,
 			"p99_cv":          p99CV,
 			"timeline":        timeline,
+
+			"client_cpu_cores": clientCPU,
+			"send_rate_pct":    sendRatePct,
 		}
 		b, _ := json.Marshal(out)
 		fmt.Println(string(b)) // machine-readable, on stdout

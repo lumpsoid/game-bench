@@ -8,9 +8,12 @@ any number.
 ## The instrument vs. the subject
 
 - **Subject:** the server, written once per language. This is what we compare.
-- **Instrument:** the load generator (`loadgen/`, Go). Written ONCE, identical for
-  every run. It must never be the bottleneck and must never steal CPU from the
-  subject, or every number is contaminated.
+- **Instrument:** the load generator — `loadgen-odin/` (Odin, default) or `loadgen/` (Go),
+  selected per run and identical across every server in that run. It must never be the
+  bottleneck and must never steal CPU from the subject, or every number is contaminated —
+  so each run self-reports `client_cpu_cores` and `send_rate_pct` to prove it didn't. The
+  Odin client is an epoll reactor (one worker thread per client core) precisely so it stays
+  lean at high connection counts where a goroutine-per-conn client would burn CPU.
 
 ## Non-negotiable rules
 

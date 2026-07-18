@@ -12,7 +12,8 @@ Fairness rules: see [METHODOLOGY.md](METHODOLOGY.md).
 ```
 PROTOCOL.md          wire spec — the single source of truth
 METHODOLOGY.md       fairness rules + how to read results
-loadgen/             the ONE automated client (Go), open-loop, built-in histogram
+loadgen/             automated client (Go), open-loop, built-in histogram
+loadgen-odin/        default automated client (Odin) — epoll reactor, won't self-saturate
 servers/
   go/     <- reference server, DONE + smoke-tested
   rust/   ocaml/  odin/  elixir/  python/   <- ported from the spec
@@ -23,7 +24,9 @@ results/             raw output + plots
 ## Status
 
 - [x] Protocol spec
-- [x] Go load generator (`loadgen`) — builds, runs, measures latency percentiles
+- [x] Load generators: **Odin** (`loadgen-odin`, default — epoll reactor, stays lean at 10k+
+      conns) and **Go** (`loadgen`); select with `runner/run.py --loadgen odin|go`. Both are
+      open-loop, share the wire protocol + JSON output, and self-report client CPU / send-rate
 - [x] **Go** server (`servers/go`) — built + smoke-tested
 - [x] **Rust** server (`servers/rust`, tokio) — built + smoke-tested
 - [x] **Elixir** server (`servers/elixir`, bare BEAM / `:gen_tcp`, `{packet,4}`) — smoke-tested;

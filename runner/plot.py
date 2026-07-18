@@ -42,6 +42,8 @@ CHARTS = [
     ("p99_cv", "Latency stability (p99 CV)", "coeff. of variation", lambda v: f"{v:.2f}", {"d": 2, "c": False}),
     ("rss_peak_mb", "Peak memory under load", "MB (RSS)", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
     ("cpu_cores", "CPU cores used", "cores", lambda v: f"{v:.2f}", {"d": 2, "c": False}),
+    ("client_cpu_cores", "Client CPU (loadgen validity)", "cores", lambda v: f"{v:.2f}", {"d": 2, "c": False}),
+    ("send_rate_pct", "Send-rate fidelity (loadgen validity)", "% of target", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
 ]
 
 # Plot geometry (shared with the client-side renderer via GEOM).

@@ -241,12 +241,12 @@ def stop_server(procs):
             pass
 
 
-def run_loadgen(loadgen, port, conns, room_size, rate, warmup, dur, client_cores):
+def run_loadgen(loadgen, port, conns, room_size, rate, warmup, dur, client_cores, extra=None):
     argv = [
         loadgen, "-addr", f"127.0.0.1:{port}", "-conns", str(conns),
         "-room-size", str(room_size), "-rate", str(rate),
         "-warmup", f"{warmup}s", "-dur", f"{dur}s", "-json",
-    ]
+    ] + (extra or [])
     r = subprocess.run(taskset_wrap(argv, cpuspec(client_cores)),
                        capture_output=True, text=True)
     line = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
@@ -307,6 +307,8 @@ def main():
     ap.add_argument("--client-cores", default="", help=f"default {half}-{ncpu-1}")
     ap.add_argument("--out", default=os.path.join(ROOT, "results", "results.csv"))
     ap.add_argument("--cooldown", type=float, default=1.0)
+    ap.add_argument("--loadgen", default="odin", choices=["odin", "go"],
+                    help="which load generator to use (odin is the leaner epoll reactor)")
     args = ap.parse_args()
 
     server_cores = parse_cores(args.server_cores, list(range(0, half)))
@@ -322,15 +324,25 @@ def main():
           f"(room={args.room_size}, rate={args.rate}Hz, tick={args.tick}Hz, "
           f"warmup={args.warmup}s, dur={args.dur}s)\n")
 
-    loadgen = os.path.join(ROOT, "loadgen", "loadgen")
-    if not build((["go", "build", "-o", "loadgen", "."], "loadgen"), "loadgen"):
+    # The Odin loadgen is a thread-per-core epoll reactor (one worker per client
+    # core) — far leaner than the Go client's goroutine-per-conn model, so it
+    # won't saturate itself at high connection counts. Pass -workers to match.
+    if args.loadgen == "odin":
+        loadgen = os.path.join(ROOT, "loadgen-odin", "loadgen-odin")
+        loadgen_build = (["odin", "build", ".", "-out:loadgen-odin", "-o:speed"], "loadgen-odin")
+        loadgen_extra = ["-workers", str(len(client_cores))]
+    else:
+        loadgen = os.path.join(ROOT, "loadgen", "loadgen")
+        loadgen_build = (["go", "build", "-o", "loadgen", "."], "loadgen")
+        loadgen_extra = []
+    if not build(loadgen_build, args.loadgen + " loadgen"):
         sys.exit(1)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     fields = ["server", "conns", "trial", "moves_sent", "snaps_recv", "measured",
               "moves_per_s", "snaps_per_s", "p50_ms", "p90_ms", "p99_ms", "p999_ms",
               "max_ms", "p99_worst_1s_ms", "p99_cv", "rss_idle_mb", "rss_peak_mb",
-              "cpu_cores"]
+              "cpu_cores", "client_cpu_cores", "send_rate_pct"]
     fh = open(args.out, "w", newline="")
     writer = csv.DictWriter(fh, fieldnames=fields)
     writer.writeheader()
@@ -365,7 +377,7 @@ def main():
                 sampler = Sampler(pgids)
                 sampler.start()
                 res = run_loadgen(loadgen, PORT, conns, args.room_size, args.rate,
-                                  args.warmup, args.dur, client_cores)
+                                  args.warmup, args.dur, client_cores, loadgen_extra)
                 sampler.stop()
                 stop_server(procs)
 
@@ -390,9 +402,25 @@ def main():
                     "rss_idle_mb": round(sampler.rss_first_kb / 1024, 1),
                     "rss_peak_mb": round(sampler.rss_peak_kb / 1024, 1),
                     "cpu_cores": round(cpu_cores, 2),
+                    "client_cpu_cores": round(res.get("client_cpu_cores", 0.0), 2),
+                    "send_rate_pct": round(res.get("send_rate_pct", 0.0), 1),
                 }
                 writer.writerow(row)
                 fh.flush()
+
+                # Loadgen validity: if the client is CPU-bound or can't keep its
+                # send schedule, the latency for this row measures the client.
+                n_client = len(client_cores)
+                if row["client_cpu_cores"] > 0.85 * n_client:
+                    sys.stderr.write(
+                        f"  ! client CPU {row['client_cpu_cores']:.2f}/{n_client} cores "
+                        f"(>85%) at {conns} conns — loadgen may be saturating; latency suspect\n")
+                # ~1-2% below target is connection-ramp slack during warmup; a real
+                # sender stall shows a large drop, so warn only well under target.
+                if row["send_rate_pct"] < 97.0:
+                    sys.stderr.write(
+                        f"  ! send rate {row['send_rate_pct']:.1f}% of target at {conns} conns "
+                        f"— sender falling behind (coordinated omission)\n")
 
                 for w in res.get("timeline", []):
                     t_s, p50, p90, p99, p999, mx = w
@@ -407,7 +435,8 @@ def main():
                 print(f"  conns={conns:<6} trial={trial}  "
                       f"snaps/s={row['snaps_per_s']:<9} p50={row['p50_ms']:<6} "
                       f"p99={row['p99_ms']:<7} rss_peak={row['rss_peak_mb']}MB "
-                      f"cpu={row['cpu_cores']}", flush=True)
+                      f"cpu={row['cpu_cores']} clientcpu={row['client_cpu_cores']} "
+                      f"send={row['send_rate_pct']}%", flush=True)
                 time.sleep(args.cooldown)
 
     fh.close()
