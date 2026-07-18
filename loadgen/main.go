@@ -54,11 +54,15 @@ func idxFor(us float64) int {
 }
 func (h *Hist) record(us float64) { atomic.AddUint64(&h.counts[idxFor(us)], 1) }
 func valFor(i int) float64        { return math.Pow(10, float64(i)/perDecade) }
-func (h *Hist) percentile(p float64) float64 {
-	var total uint64
+func (h *Hist) total() uint64 {
+	var t uint64
 	for i := range h.counts {
-		total += atomic.LoadUint64(&h.counts[i])
+		t += atomic.LoadUint64(&h.counts[i])
 	}
+	return t
+}
+func (h *Hist) percentile(p float64) float64 {
+	total := h.total()
 	if total == 0 {
 		return 0
 	}
@@ -80,6 +84,45 @@ var (
 	snapsRecv uint64
 	measured  uint64
 )
+
+// ---- per-window latency (stability over time) ----
+// One histogram per fixed wall-clock window of the measured phase; per-window p99
+// then yields "worst single window" and a scale-free steadiness score (CV).
+
+const windowMS = 1000 // 1 s windows
+
+var windows []Hist // sized in main(); indexed by (elapsed-warmup)/windowMS
+
+func recordWindow(sinceStart, warm time.Duration, us float64) {
+	if w := int((sinceStart - warm).Milliseconds()) / windowMS; w >= 0 && w < len(windows) {
+		windows[w].record(us)
+	}
+}
+
+// stabilityStats returns the worst (max) window value and the coefficient of
+// variation (sample stdev / mean) across non-empty windows.
+func stabilityStats(xs []float64) (worst, cv float64) {
+	if len(xs) == 0 {
+		return 0, 0
+	}
+	var sum float64
+	for _, x := range xs {
+		if x > worst {
+			worst = x
+		}
+		sum += x
+	}
+	mean := sum / float64(len(xs))
+	if len(xs) < 2 || mean == 0 {
+		return worst, 0
+	}
+	var ss float64
+	for _, x := range xs {
+		d := x - mean
+		ss += d * d
+	}
+	return worst, math.Sqrt(ss/float64(len(xs)-1)) / mean
+}
 
 // ---- wire helpers ----
 
@@ -167,8 +210,9 @@ func runConn(addr string, roomID uint32, rate int, dur, warm time.Duration, h *H
 					if lastSeq != 0 {
 						if st := atomic.LoadInt64(&sendAt[lastSeq%ring]); st != 0 {
 							us := float64(time.Now().UnixNano()-st) / 1000.0
-							if us > 0 && time.Since(start) > warm {
+							if sinceStart := time.Since(start); us > 0 && sinceStart > warm {
 								h.record(us)
+								recordWindow(sinceStart, warm, us)
 								atomic.AddUint64(&measured, 1)
 							}
 						}
@@ -209,6 +253,11 @@ func main() {
 	flag.Parse()
 
 	h := &Hist{}
+	nWin := int(dur.Milliseconds()) / windowMS
+	if nWin < 1 {
+		nWin = 1
+	}
+	windows = make([]Hist, nWin)
 	var wg sync.WaitGroup
 	start := time.Now()
 	for i := 0; i < *conns; i++ {
@@ -232,6 +281,30 @@ func main() {
 		h.percentile(0.50)/1000, h.percentile(0.90)/1000, h.percentile(0.99)/1000,
 		h.percentile(0.999)/1000, h.percentile(1.0)/1000)
 
+	// per-window latency timeline (full spread) + p99 stability scalars.
+	// timeline[i] = [window_start_s, p50, p90, p99, p99.9, max] in ms; empty
+	// windows are skipped so the client can't mistake "no data" for "0 ms".
+	timeline := make([][]float64, 0, len(windows))
+	p99s := make([]float64, 0, len(windows))
+	for i := range windows {
+		if windows[i].total() == 0 {
+			continue
+		}
+		p99 := windows[i].percentile(0.99) / 1000
+		p99s = append(p99s, p99)
+		timeline = append(timeline, []float64{
+			float64(i),
+			windows[i].percentile(0.50) / 1000,
+			windows[i].percentile(0.90) / 1000,
+			p99,
+			windows[i].percentile(0.999) / 1000,
+			windows[i].percentile(1.0) / 1000,
+		})
+	}
+	p99Worst, p99CV := stabilityStats(p99s)
+	log.Printf("latency stability: p99_worst_1s=%.2f ms p99_cv=%.3f (%d windows)",
+		p99Worst, p99CV, len(p99s))
+
 	if *jsonOut {
 		out := map[string]any{
 			"conns":       *conns,
@@ -245,6 +318,10 @@ func main() {
 			"p99_ms":      h.percentile(0.99) / 1000,
 			"p999_ms":     h.percentile(0.999) / 1000,
 			"max_ms":      h.percentile(1.0) / 1000,
+
+			"p99_worst_1s_ms": p99Worst,
+			"p99_cv":          p99CV,
+			"timeline":        timeline,
 		}
 		b, _ := json.Marshal(out)
 		fmt.Println(string(b)) // machine-readable, on stdout

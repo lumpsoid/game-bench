@@ -329,10 +329,20 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     fields = ["server", "conns", "trial", "moves_sent", "snaps_recv", "measured",
               "moves_per_s", "snaps_per_s", "p50_ms", "p90_ms", "p99_ms", "p999_ms",
-              "max_ms", "rss_idle_mb", "rss_peak_mb", "cpu_cores"]
+              "max_ms", "p99_worst_1s_ms", "p99_cv", "rss_idle_mb", "rss_peak_mb",
+              "cpu_cores"]
     fh = open(args.out, "w", newline="")
     writer = csv.DictWriter(fh, fieldnames=fields)
     writer.writeheader()
+
+    # Per-run latency timeline (long format: one row per 1 s window). Kept in a
+    # separate file because it is many-rows-per-run, unlike the summary CSV above.
+    tl_path = os.path.join(os.path.dirname(args.out), "timeline.csv")
+    tl_fh = open(tl_path, "w", newline="")
+    tl_writer = csv.DictWriter(tl_fh, fieldnames=[
+        "server", "conns", "trial", "t_s",
+        "p50_ms", "p90_ms", "p99_ms", "p999_ms", "max_ms"])
+    tl_writer.writeheader()
 
     for name in servers:
         if name not in SERVERS:
@@ -375,12 +385,25 @@ def main():
                     "p50_ms": round(res["p50_ms"], 2), "p90_ms": round(res["p90_ms"], 2),
                     "p99_ms": round(res["p99_ms"], 2), "p999_ms": round(res["p999_ms"], 2),
                     "max_ms": round(res["max_ms"], 2),
+                    "p99_worst_1s_ms": round(res["p99_worst_1s_ms"], 2),
+                    "p99_cv": round(res["p99_cv"], 3),
                     "rss_idle_mb": round(sampler.rss_first_kb / 1024, 1),
                     "rss_peak_mb": round(sampler.rss_peak_kb / 1024, 1),
                     "cpu_cores": round(cpu_cores, 2),
                 }
                 writer.writerow(row)
                 fh.flush()
+
+                for w in res.get("timeline", []):
+                    t_s, p50, p90, p99, p999, mx = w
+                    tl_writer.writerow({
+                        "server": name, "conns": conns, "trial": trial,
+                        "t_s": int(t_s),
+                        "p50_ms": round(p50, 2), "p90_ms": round(p90, 2),
+                        "p99_ms": round(p99, 2), "p999_ms": round(p999, 2),
+                        "max_ms": round(mx, 2),
+                    })
+                tl_fh.flush()
                 print(f"  conns={conns:<6} trial={trial}  "
                       f"snaps/s={row['snaps_per_s']:<9} p50={row['p50_ms']:<6} "
                       f"p99={row['p99_ms']:<7} rss_peak={row['rss_peak_mb']}MB "
@@ -388,7 +411,9 @@ def main():
                 time.sleep(args.cooldown)
 
     fh.close()
+    tl_fh.close()
     print(f"\nwrote {args.out}")
+    print(f"wrote {tl_path}")
 
 
 if __name__ == "__main__":

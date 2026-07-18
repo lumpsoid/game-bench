@@ -22,6 +22,7 @@ table is included (the palette's low-contrast light slots require this relief).
 import argparse
 import csv
 import json
+import math
 import os
 import statistics
 from collections import defaultdict
@@ -37,6 +38,8 @@ CHARTS = [
     ("moves_per_s", "Throughput (processed)", "moves / s", lambda v: f"{v:,.0f}", {"d": 0, "c": True}),
     ("p99_ms", "Latency p99", "ms", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
     ("p50_ms", "Latency p50", "ms", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
+    ("p99_worst_1s_ms", "Worst 1 s p99", "ms", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
+    ("p99_cv", "Latency stability (p99 CV)", "coeff. of variation", lambda v: f"{v:.2f}", {"d": 2, "c": False}),
     ("rss_peak_mb", "Peak memory under load", "MB (RSS)", lambda v: f"{v:.1f}", {"d": 1, "c": False}),
     ("cpu_cores", "CPU cores used", "cores", lambda v: f"{v:.2f}", {"d": 2, "c": False}),
 ]
@@ -165,6 +168,16 @@ th:nth-child(2),td:nth-child(2){text-align:right}
 td .sw{display:inline-block;margin-right:6px;vertical-align:middle}
 details{margin-top:8px} summary{cursor:pointer;color:var(--ink2);font-size:14px;padding:8px 0}
 .noscript{color:var(--ink2);font-size:13px;margin:0 0 16px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin:0 0 24px}
+.tab{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--ink2);
+  font:inherit;font-size:14px;padding:9px 16px;margin-bottom:-1px;cursor:pointer;
+  transition:color .12s,border-color .12s}
+.tab:hover{color:var(--ink)}
+.tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--series-1);font-weight:600}
+[role="tabpanel"][hidden]{display:none}
+.card-meta{color:var(--muted);font-size:12px;margin:0 4px 2px;text-align:right}
+.plegend{display:flex;gap:14px;flex-wrap:wrap;margin:0 0 20px;align-items:center}
+.pleg{display:inline-flex;align-items:center;gap:6px;color:var(--ink2);font-size:13px}
 """
 
 # Client-side renderer. Mirrors the former server-side SVG builder, but driven by
@@ -297,7 +310,154 @@ JS = r"""
 """
 
 
-def build_html(data, servers, all_conns, src):
+# ---- latency-over-time (timeline.csv) --------------------------------------
+# One card per (server, load level): the full latency spread as separate lines
+# over time, so you see typical AND tail latency and whether either drifts or
+# spikes across the run. Static inline SVG (no interactivity needed here).
+
+# Percentile -> label -> colour, ramped green(typical) -> red(worst tail). Fixed
+# colours (not the server palette): each card is a single server, so these
+# encode the percentile, and they read on both light and dark backgrounds.
+TL_SERIES = [
+    ("p50_ms", "p50", "#2a9d5c"),
+    ("p90_ms", "p90", "#8aa32e"),
+    ("p99_ms", "p99", "#eda100"),
+    ("p999_ms", "p99.9", "#e8663d"),
+    ("max_ms", "max", "#d6453f"),
+]
+
+
+def nice_max(v):
+    if v <= 0:
+        return 1
+    exp = math.floor(math.log10(v))
+    f = v / 10 ** exp
+    nf = 1 if f <= 1 else 2 if f <= 2 else 5 if f <= 5 else 10
+    return nf * 10 ** exp
+
+
+def load_timeline(path):
+    """(server, conns) -> trial -> [rows sorted by t_s]."""
+    data = defaultdict(lambda: defaultdict(list))
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            data[(row["server"], int(row["conns"]))][int(row["trial"])].append(row)
+    for key in data:
+        for tr in data[key]:
+            data[key][tr].sort(key=lambda r: int(r["t_s"]))
+    return data
+
+
+def timeline_svg(server, conns, rows):
+    X0, X1, Y0, Y1 = ML, W - MR, H - MB, MT
+    maxT = max((int(r["t_s"]) for r in rows), default=0)
+    vmax = 0.0
+    for r in rows:
+        for field, _, _ in TL_SERIES:
+            try:
+                vmax = max(vmax, float(r[field]))
+            except (KeyError, ValueError):
+                pass
+    ymax = nice_max(vmax) if vmax > 0 else 1
+
+    def X(t):
+        return X0 if maxT <= 0 else X0 + (X1 - X0) * t / maxT
+
+    def Y(v):
+        return Y0 - (Y0 - Y1) * (v / ymax)
+
+    svg = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" '
+           f'aria-label="{esc(server)} latency over time" preserveAspectRatio="xMidYMid meet">']
+    svg.append(f'<text x="{ML}" y="24" class="c-title">{esc(server)} @ {conns:,} conns</text>')
+    for k in range(6):
+        v = ymax * k / 5
+        y = Y(v)
+        svg.append(f'<line x1="{X0}" y1="{y:.1f}" x2="{X1}" y2="{y:.1f}" class="grid"/>')
+        svg.append(f'<text x="{X0 - 10}" y="{y + 4:.1f}" class="tick tick-y">{v:.1f}</text>')
+    svg.append(f'<text class="axis-label" transform="translate(18,{(Y0 + Y1) / 2}) rotate(-90)">ms</text>')
+    step = max(1, -(-maxT // 6))
+    t = 0
+    while t <= maxT:
+        svg.append(f'<text x="{X(t):.1f}" y="{Y0 + 22}" class="tick tick-x">{t}</text>')
+        t += step
+    svg.append(f'<text x="{(X0 + X1) / 2}" y="{H - 8}" class="axis-label">time (s, measured phase)</text>')
+    svg.append(f'<line x1="{X0}" y1="{Y0}" x2="{X1}" y2="{Y0}" class="baseline"/>')
+    for field, label, color in TL_SERIES:
+        pts = []
+        for r in rows:
+            try:
+                pts.append((int(r["t_s"]), float(r[field])))
+            except (KeyError, ValueError):
+                pass
+        if not pts:
+            continue
+        d = " ".join(("M" if i == 0 else "L") + f"{X(t):.1f},{Y(v):.1f}"
+                     for i, (t, v) in enumerate(pts))
+        svg.append(f'<path d="{d}" fill="none" stroke="{color}" stroke-width="2" '
+                   f'stroke-linejoin="round" stroke-linecap="round"/>')
+        ly = Y(pts[-1][1])
+        svg.append(f'<text x="{X1 + 8}" y="{ly + 4:.1f}" class="direct-label" '
+                   f'fill="{color}">{esc(label)}</text>')
+    svg.append("</svg>")
+    return "".join(svg)
+
+
+def timeline_body(tl_data, src):
+    """Latency-over-time tab content (no <html> wrapper — embedded in the page)."""
+    if not tl_data:
+        return ('<p class="sub">No timeline data yet. Run <code>runner/run.py</code> '
+                'to generate <code>timeline.csv</code> next to the results CSV.</p>')
+    order = ORDER + sorted({k[0] for k in tl_data} - set(ORDER))
+    keys = sorted(tl_data, key=lambda k: (order.index(k[0]) if k[0] in order else 999, k[1]))
+    cards = []
+    for server, conns in keys:
+        trials = tl_data[(server, conns)]
+        tr = min(trials)  # lowest trial number, deterministic
+        rows = trials[tr]
+        if not rows:
+            continue
+        cards.append(f'<div class="card"><div class="card-meta">trial {tr}</div>'
+                     f'{timeline_svg(server, conns, rows)}</div>')
+    legend = "".join(f'<span class="pleg"><span class="sw" style="background:{c}"></span>'
+                     f'{esc(l)}</span>' for _, l, c in TL_SERIES)
+    return (f'<p class="sub">one card per server × load level · x = seconds into the '
+            f'measured phase · 1 s windows · source: {esc(os.path.basename(src))}</p>'
+            f'<div class="plegend">{legend}</div>{"".join(cards)}')
+
+
+# Tab switcher: show the selected panel, hide the rest. Progressive enhancement —
+# without JS the saturation panel stays visible (its data table is complete).
+TAB_JS = r"""
+(function(){
+  var tabs = [].slice.call(document.querySelectorAll('.tab'));
+  function sel(id){
+    tabs.forEach(function(t){
+      var on = t.id === id;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      var p = document.getElementById(t.getAttribute('aria-controls'));
+      if(p) p.hidden = !on;
+    });
+  }
+  tabs.forEach(function(t){ t.addEventListener('click', function(){ sel(t.id); }); });
+})();
+"""
+
+
+def saturation_body(data, servers, all_conns, src):
+    cards = "".join(f'<div class="card"><div id="chart-{i}"></div></div>'
+                    for i in range(len(CHARTS)))
+    return (f'<p class="sub">median over trials · x = offered load (connections) · '
+            f'source: {esc(os.path.basename(src))}</p>'
+            f'<p class="sub" style="margin-top:-16px">Click a server to hide it — '
+            f"the axes rescale to what's left.</p>"
+            f'<noscript><p class="noscript">This tab needs JavaScript to draw the charts. '
+            f'The data table below is complete.</p></noscript>'
+            f'{legend_html(servers)}{cards}'
+            f'<details open><summary>Data table</summary>'
+            f'<div class="card">{table_html(data,servers,all_conns)}</div></details>')
+
+
+def build_html(data, servers, all_conns, src, tl_data=None, tl_src=None):
     cfg = {
         "geom": GEOM,
         "conns": all_conns,
@@ -308,21 +468,22 @@ def build_html(data, servers, all_conns, src):
                    for f, t, y, _fmt, spec in CHARTS],
     }
     js = JS.replace("__CFG__", json.dumps(cfg))
-    cards = "".join(f'<div class="card"><div id="chart-{i}"></div></div>'
-                    for i in range(len(CHARTS)))
+    sat = saturation_body(data, servers, all_conns, src)
+    tl = timeline_body(tl_data, tl_src or src)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>game-bench — saturation curves</title><style>{CSS}</style></head>
+<title>game-bench — report</title><style>{CSS}</style></head>
 <body><div class="wrap">
-<h1>Saturation curves</h1>
-<p class="sub">median over trials · x = offered load (connections) · source: {esc(os.path.basename(src))}</p>
-<p class="sub" style="margin-top:-16px">Click a server to hide it — the axes rescale to what's left.</p>
-<noscript><p class="noscript">This report needs JavaScript to draw the charts. The data table below is complete.</p></noscript>
-{legend_html(servers)}
-{cards}
-<details open><summary>Data table</summary><div class="card">{table_html(data,servers,all_conns)}</div></details>
+<h1>game-bench</h1>
+<div class="tabs" role="tablist" aria-label="Views">
+<button class="tab" role="tab" id="tab-sat" aria-controls="panel-sat" aria-selected="true">Saturation curves</button>
+<button class="tab" role="tab" id="tab-tl" aria-controls="panel-tl" aria-selected="false">Latency over time</button>
+</div>
+<section id="panel-sat" role="tabpanel" aria-labelledby="tab-sat">{sat}</section>
+<section id="panel-tl" role="tabpanel" aria-labelledby="tab-tl" hidden>{tl}</section>
 </div>
 <script>{js}</script>
+<script>{TAB_JS}</script>
 </body></html>"""
 
 
@@ -336,11 +497,18 @@ def main():
     data, servers, all_conns = load(args.csv)
     if not servers or not all_conns:
         raise SystemExit(f"no data in {args.csv}")
-    html = build_html(data, servers, all_conns, args.csv)
+
+    # A timeline.csv next to the summary CSV becomes the "Latency over time" tab.
+    tl_csv = os.path.join(os.path.dirname(os.path.abspath(args.csv)), "timeline.csv")
+    tl_data = load_timeline(tl_csv) if os.path.exists(tl_csv) else None
+
+    html = build_html(data, servers, all_conns, args.csv, tl_data, tl_csv)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(html)
-    print(f"wrote {args.out}  ({len(servers)} servers, {len(all_conns)} load levels)")
+    n_tl = len(tl_data) if tl_data else 0
+    print(f"wrote {args.out}  ({len(servers)} servers, {len(all_conns)} load levels, "
+          f"{n_tl} run timelines)")
 
 
 if __name__ == "__main__":
