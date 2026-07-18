@@ -28,8 +28,8 @@ import statistics
 from collections import defaultdict
 
 # Fixed entity->slot mapping (color follows the server, never its rank).
-SLOT = {"go": 1, "rust": 2, "ocaml": 3, "elixir": 4, "python": 5}
-ORDER = ["go", "rust", "ocaml", "elixir", "python"]
+SLOT = {"go": 1, "rust": 2, "ocaml": 3, "elixir": 4, "python": 5, "go-pool": 5, "go-epoll": 3}
+ORDER = ["go", "go-pool", "go-epoll", "rust", "ocaml", "elixir", "python"]
 
 # Charts: (csv_field, title, y-axis label, python formatter, js format spec).
 # The js spec {"d": decimals, "c": thousands-comma} mirrors the python formatter

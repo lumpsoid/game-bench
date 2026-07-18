@@ -6,3 +6,5 @@ runner/__pycache__/
 /loadgen/loadgen
 /loadgen-odin/loadgen-odin
 /servers/go/gosrv
+/servers/go-pool/gosrv-pool
+/servers/go-epoll/gosrv-epoll

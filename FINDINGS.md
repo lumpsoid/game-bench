@@ -262,3 +262,122 @@ a scheduling artifact that *disappears* under load, Go's is the runtime (GC) and
 `GODEBUG=gctrace=1` (or `GOGC=off` for a short run) and check the spike timestamps
 line up with GC cycles; flatten the Odin 5k sawtooth by moving its tick loop to a
 self-clocked / higher-resolution timer instead of the ms-granular epoll timeout.
+
+## `sync.Pool` vs. the memory ramp — how much of Go's RSS is churn vs. per-conn fixed cost?
+
+**Question.** The Go server allocates two fresh buffers per room per tick (the
+snapshot `payload` + its framing buffer — see the churn note above). `sync.Pool` is
+the idiomatic "allocate-per-request, reclaim-at-end" fix: return buffers to a pool
+instead of letting the GC chase them. How much of Go's RSS ramp with connection count
+does that actually remove?
+
+**Variant.** `servers/go-pool/` is byte-for-byte identical to `servers/go/` except the
+per-tick snapshot path: one pooled buffer holds the whole frame (`[u32 len | payload]`,
+so two allocs → zero once warm). Because the snapshot is **broadcast** — one buffer
+handed to every connection's writer goroutine — it outlives `step()`, so a naive
+`pool.Put` at end-of-tick would recycle a buffer writers still hold. The buffer is
+therefore **reference-counted**: `ref = #recipients`, each writer calls `release()`
+after `nc.Write`, last one back to the pool. This is the broadcast analog of the
+per-request pattern: reclaim-when-done, not free-at-request-end. Verified race-free
+(`go build -race`, 200-conn load, clean) and wire-identical to the reference server.
+
+**Result** (median of 3 trials, 8 server cores, Odin loadgen, same session as `go`):
+
+| conns  | go peak RSS | go-pool peak RSS | saved |
+|-------:|------------:|-----------------:|------:|
+| 500    | 14.9 MB     | 13.1 MB          | 12%   |
+| 1000   | 21.8 MB     | 18.8 MB          | 14%   |
+| 2000   | 36.1 MB     | 30.0 MB          | 17%   |
+| 5000   | 78.7 MB     | 63.4 MB          | 19%   |
+| 10000  | 150.1 MB    | 118.9 MB         | 21%   |
+
+Throughput, CPU and p50 are unchanged (identical within noise). Idle RSS is identical
+(~5.5 MB) — pooling changes nothing until traffic flows.
+
+**Interpretation — pooling flattens the ramp but does not bend it.**
+
+- The saving *grows with load* (12% → 21%) because it removes **transient churn**: the
+  per-tick snapshot garbage that `GOGC=100` lets accumulate to ~2× live between
+  collections. More connections → higher snapshot broadcast rate → bigger transient
+  set → bigger high-water mark. Pool it and that whole term drops out. This is a real,
+  free ~20% peak-RSS win with no throughput/CPU/latency cost.
+- But the **ramp is still steep**: the per-connection slope only falls from **14.2 to
+  11.1 MB per 1000 conns** (~22%). Even fully pooled, go-pool at 10k (119 MB) is ~25×
+  Rust's footprint at the same load. That residual ramp is **per-connection fixed cost
+  the pool cannot touch**: 2 goroutine stacks per conn (reader + writer, ~8 KB min each
+  → the dominant term: ~20000 stacks at 10k), the 64-slot send channel, and runtime
+  bookkeeping. `sync.Pool` recycles *heap objects*; it does nothing for *goroutine
+  stacks*, and this architecture spends two of them per connection.
+
+- Secondary win: **tail jitter halves**. p99 CV at 10k drops from 0.064 (go) to 0.028
+  (go-pool). Fewer/cheaper GC cycles → less assist + STW work landing on the tail —
+  consistent with the GC-tail-spike finding above. p99 itself is within noise
+  (51.9 vs 53.6 ms).
+
+**Lesson.** `sync.Pool` is the right tool for the allocation it targets (broadcast
+snapshot churn: ~20% peak RSS, halved tail jitter, zero cost) — but it is not why Go
+uses more memory than Rust here. Go's connection-count ramp is dominated by the
+**goroutine-per-connection-times-two** model, not by heap churn. To actually bend the
+ramp you'd change the *architecture* (one goroutine per conn instead of two; or an
+epoll reactor like the Odin/Python servers), not add more pooling. Data:
+`results/pool/results.csv`; report: `results/pool/report.html`.
+
+## The epoll reactor bends the ramp flat — Go's memory ramp *is* the goroutine model
+
+**Follow-on to the `sync.Pool` result above.** Pooling the snapshot buffers only
+shaved ~20% off peak RSS and barely moved the per-connection slope (14.2 → 10.8 MB
+per 1000 conns), which pointed the finger at per-connection *fixed* cost — two
+goroutine stacks per connection (reader + writer) — not heap churn. `servers/go-epoll/`
+tests that directly: same wire protocol, same load-shedding, but **zero goroutines per
+connection**. It is a thread-per-core sharded epoll reactor (a direct port of
+`servers/odin`): N single-threaded event loops, one per core, each owning its
+connections and rooms, SO_REUSEPORT spreading accepts. A connection is now a `Conn`
+struct + its rbuf/wbuf (~1 KB warm) instead of two ~8 KB stacks; snapshot churn also
+vanishes for free (single-threaded worker builds into one reused scratch buffer — no
+allocation, no `sync.Pool` needed).
+
+**Peak RSS under load** (median of 3, 8 server cores, Odin loadgen, same session):
+
+| conns  | go       | go-pool  | go-epoll | epoll vs go |
+|-------:|---------:|---------:|---------:|------------:|
+| 500    | 14.8 MB  | 13.2 MB  | 6.2 MB   | −58%        |
+| 1000   | 21.8 MB  | 18.6 MB  | 6.4 MB   | −71%        |
+| 2000   | 35.6 MB  | 29.9 MB  | 6.6 MB   | −81%        |
+| 5000   | 78.8 MB  | 62.6 MB  | 7.8 MB   | −90%        |
+| 10000  | 149.6 MB | 115.8 MB | **8.6 MB** | **−94%**  |
+
+**Per-connection ramp slope: go 14.2 → go-pool 10.8 → go-epoll 0.3 MB per 1000 conns.**
+The reactor's slope is essentially zero: 10k connections cost it +3 MB over idle. This
+is the whole answer to the original question — Go's memory ramp with connection count
+was the goroutine-per-connection-times-two model, and `sync.Pool` couldn't touch it
+because it recycles heap objects, not goroutine stacks. Remove the goroutines and the
+ramp disappears; go-epoll now sits in the same tiny-footprint class as the Odin reactor.
+
+**It's also ~40% cheaper on CPU** — at 10k conns, 2.33 cores vs go's 4.04. No goroutine
+scheduling, no per-conn channel sends, no GC: the reactor just does syscalls.
+Throughput is identical (296k vs 295k snaps/s).
+
+**The tradeoff is tail latency at high fan-out.** p99 (ms):
+
+| conns | go   | go-epoll |
+|------:|-----:|---------:|
+| 500   | 50.6 | 40.0     |
+| 2000  | 50.1 | 47.3     |
+| 5000  | 49.8 | 59.8     |
+| 10000 | 55.5 | 64.4     |
+
+Below ~2k conns the reactor wins the tail; above it, it loses ~10 ms. The cause is
+structural: each worker steps **all** its rooms in one `onTick`, so at 10k/8 workers
+that's ~25 rooms × 50 conns = ~1250 snapshots built and written **serially** at each
+tick boundary. The goroutine server instead fans each room's broadcast out to per-conn
+writer goroutines that the scheduler spreads across cores — more parallel, lower tail,
+at the cost of all those stacks. Notably the reactor's tail is *more stable* (p99 CV
+0.005 vs go's 0.032 at 10k): no GC pauses to inject jitter, just a higher steady floor.
+
+**Lesson.** Three points on one curve, same language, same protocol: `go` (2 goroutines
++ GC churn), `go-pool` (2 goroutines, churn pooled away), `go-epoll` (no goroutines).
+Memory tracks the goroutine count, not the allocation rate — pooling bought 20%, ditching
+the goroutines bought 94%. The reactor is the right tool when footprint and CPU per
+connection matter (many idle/slow conns); the goroutine model is simpler and keeps the
+tail flatter under heavy per-room fan-out. Data: `results/pool/results.csv`; report:
+`results/pool/report.html`.

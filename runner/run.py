@@ -57,6 +57,21 @@ def spec_go(port, tick, cores):
     return [([exe, "-addr", f":{port}", "-tick", str(tick)], env, cpuspec(cores))]
 
 
+def spec_go_pool(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/go-pool/gosrv-pool")
+    env = {"GOMAXPROCS": str(len(cores))}
+    return [([exe, "-addr", f":{port}", "-tick", str(tick)], env, cpuspec(cores))]
+
+
+def spec_go_epoll(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/go-epoll/gosrv-epoll")
+    # Thread-per-core epoll reactor: one worker per server core, SO_REUSEPORT
+    # kernel-load-balances accepts across them (same model as odin/python).
+    env = {"GOMAXPROCS": str(len(cores))}
+    argv = [exe, "-addr", f":{port}", "-tick", str(tick), "-workers", str(len(cores))]
+    return [(argv, env, cpuspec(cores))]
+
+
 def spec_rust(port, tick, cores):
     exe = os.path.join(ROOT, "servers/rust/target/release/server-rust")
     env = {"TOKIO_WORKER_THREADS": str(len(cores))}
@@ -96,6 +111,8 @@ def spec_python(port, tick, cores):
 
 SERVERS = {
     "go":     {"build": (["go", "build", "-o", "gosrv", "."], "servers/go"),               "spec": spec_go},
+    "go-pool":{"build": (["go", "build", "-o", "gosrv-pool", "."], "servers/go-pool"),      "spec": spec_go_pool},
+    "go-epoll":{"build": (["go", "build", "-o", "gosrv-epoll", "."], "servers/go-epoll"),   "spec": spec_go_epoll},
     "rust":   {"build": (["cargo", "build", "--release"], "servers/rust"),                  "spec": spec_rust},
     "ocaml":  {"build": (["opam", "exec", "--", "dune", "build", "--profile", "release"], "servers/ocaml"), "spec": spec_ocaml},
     "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
