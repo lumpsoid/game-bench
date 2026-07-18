@@ -415,8 +415,10 @@ def main():
                     sys.stderr.write(
                         f"  ! client CPU {row['client_cpu_cores']:.2f}/{n_client} cores "
                         f"(>85%) at {conns} conns — loadgen may be saturating; latency suspect\n")
-                # ~1-2% below target is connection-ramp slack during warmup; a real
-                # sender stall shows a large drop, so warn only well under target.
+                # send% now measures the steady-state (post-warmup) window only, so
+                # a healthy run sits at ~99-100%; the warmup connection-ramp no longer
+                # counts against it. A dip below target is therefore a genuine mid-run
+                # sender stall (real coordinated omission), not establishment slack.
                 if row["send_rate_pct"] < 97.0:
                     sys.stderr.write(
                         f"  ! send rate {row['send_rate_pct']:.1f}% of target at {conns} conns "

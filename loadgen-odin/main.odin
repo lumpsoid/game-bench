@@ -170,6 +170,7 @@ Worker :: struct {
 	hist:        Hist,
 	windows:     []Hist,
 	moves_sent:  u64,
+	moves_measured: u64, // moves fired in the post-warmup window (send% numerator)
 	snaps_recv:  u64,
 	measured:    u64,
 }
@@ -233,6 +234,9 @@ send_move :: proc(w: ^Worker, c: ^CConn, now: i64) {
 	put_u16(frame[11:], 0) // dy
 	enqueue(w, c, frame[:])
 	w.moves_sent += 1
+	// send% is measured over the steady-state window only, matching the latency
+	// gate below: warmup ramp (conns still JOINing) must not count against it.
+	if now - w.start_ns > w.warm_ns {w.moves_measured += 1}
 }
 
 // ---- inbound ----
@@ -570,11 +574,12 @@ main :: proc() {
 	// merge worker-local results
 	total: Hist
 	windows := make([]Hist, nwin)
-	moves, snaps, measured: u64
+	moves, moves_measured, snaps, measured: u64
 	for w in workers {
 		hist_merge(&total, &w.hist)
 		for k in 0 ..< nwin {hist_merge(&windows[k], &w.windows[k])}
 		moves += w.moves_sent
+		moves_measured += w.moves_measured
 		snaps += w.snaps_recv
 		measured += w.measured
 	}
@@ -609,8 +614,14 @@ main :: proc() {
 	p99_worst, p99_cv := stability_stats(p99s[:])
 
 	client_cpu := self_cpu_cores(secs)
-	send_target := f64(conns) * f64(rate) * (f64(warm_ns + dur_ns) / 1e9)
-	send_rate_pct := send_target > 0 ? 100.0 * f64(moves) / send_target : 100.0
+	// send% covers ONLY the steady-state (post-warmup) window. A connection enters
+	// the send schedule after JOIN, so charging it for the warmup ramp understated
+	// healthy runs and penalized servers with a slightly heavier accept path (e.g.
+	// Tokio's accept+spawn). By the measured window every conn is joined and should
+	// send at full rate, so a dip here now means a genuine mid-run sender stall
+	// (real coordinated omission), not connection-establishment slack.
+	send_target := f64(conns) * f64(rate) * (f64(dur_ns) / 1e9)
+	send_rate_pct := send_target > 0 ? 100.0 * f64(moves_measured) / send_target : 100.0
 
 	// human-readable lines on stderr; machine JSON on stdout (matches Go loadgen)
 	fmt.eprintfln("conns=%d moves=%d snaps=%d measured=%d", conns, moves, snaps, measured)

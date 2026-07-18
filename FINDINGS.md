@@ -114,3 +114,151 @@ servers all share one property regardless of async-vs-threads: the broadcast fan
 is distributed across cores and each room owns its state (Go/Rust: one task per room;
 Odin: one shard per core). Centralizing the tick on one domain threw away exactly the
 multicore the additional domains were meant to provide.
+
+## Reading the loadgen self-check (`send%` / `clientcpu`)
+
+The Odin loadgen (`loadgen-odin/main.odin`) is **open-loop**: each worker thread
+fires MOVEs on a fixed 20 Hz schedule and never waits for replies, so server stalls
+surface as latency instead of being hidden. Two mechanics govern what `send%`
+(`send_rate_pct`) means, and both are load-bearing for interpreting a run:
+
+1. A MOVE is counted the instant it is **enqueued** — `send_move` does
+   `moves_sent += 1` right after `enqueue`, *even if the socket returns EAGAIN and
+   the byte sits in `wbuf`*. **Socket backpressure alone therefore does not lower
+   `send%`.**
+2. The only thing that lowers `send%` is the **snap-forward** in the send loop: if a
+   connection's deadline has slipped more than one full interval (>50 ms), the
+   loadgen *drops* the missed ticks rather than bursting to catch up
+   (`if now - head.next_send > interval_ns { head.next_send = now + interval_ns }`).
+   That dropped tick is the shortfall — the deliberate anti-coordinated-omission move.
+
+So **`send% < 100` means exactly one thing: a worker thread was too busy to revisit
+its send schedule for >50 ms** — either CPU-bound draining recv work, or drowning in
+`EPOLLOUT` flush events because the *server's read side* is backpressuring the
+client's writes. And because `send_target = conns × rate × (warmup + dur)` bills
+every connection for the full window, **connection-establishment ramp is a permanent
+floor tax**: a connection only starts sending after TCP-connect + JOIN→JOINED.
+
+Three observations from the Odin-loadgen matrix, each a distinct mechanism:
+
+**Rust's ~1–2.7% `send%` dip is establishment ramp, not omission.** The tell: Rust is
+already at 99.0% at 500 conns, where the client is 99.99% idle (`clientcpu≈0.22`) —
+no CPU pressure and no backpressure is possible, so the only thing that can cost
+sends is connections entering the schedule late. Tokio's accept-and-spawn path is a
+touch heavier per connection than Go's/Odin's accept loops, so Rust's connections
+join marginally later; that lost lead-in is a ~1% constant tax that grows to ~2.7% at
+10k as accept contention rises. It is **not** a mid-run stall — Rust has the cleanest
+latencies of the field at 10k (p99 ≈ 54 ms, best of all) and normal `clientcpu`. The
+metric was slightly *unfair* to Rust here: it was the one number that made the
+healthiest server look worst, and it was really just measuring Tokio's accept warm-up.
+
+**Fixed (both loadgens).** `send%` now measures only the steady-state (post-warmup)
+window — a warmup-gated `moves_measured` counter (mirroring the existing latency gate
+`(now - start) > warm`) over `target = conns × rate × dur`, dropping `warmup` from the
+denominator. A connection only enters the send schedule after JOIN, so the ramp no
+longer counts against it; by the measured window every conn is joined and sending at
+full rate. Effect: Rust @ 2k rose 98.1% → **100.0%**, and a dip now unambiguously means
+a genuine mid-run sender stall. Elixir's real 82% stall at 10k is unaffected — its
+shortfall is *inside* the measured window. See `moves_measured` in
+`loadgen-odin/main.odin` and `movesMeasured` in `loadgen/main.go`.
+
+**A missing omission warning does not mean the server is healthy.** At 10k:
+
+- **OCaml**: p99 ≈ **8,800 ms** but `send=98.9%`, *no warning*. Its bottleneck is
+  snapshot *production* (the tick/coalescing writer stalls; `snaps/s` ≈ 146k, half of
+  Go's ~296k), but it still drains the client's tiny 13-byte MOVEs fine, so there is
+  no write-backpressure. The client keeps cadence → the 8.8 s tail is **real and
+  honestly measured**.
+- **Elixir**: p99 ≈ 350–515 ms but `send=82%`, *warning fires*. Its **read** side
+  falls behind (at 10k BEAM processes, a connection isn't scheduled to drain its
+  socket promptly) → the client's writes back up → the worker floods with `EPOLLOUT`
+  flushes → it can't revisit the send schedule within 50 ms → ~18% of ticks dropped.
+  So the 350 ms p99 is **optimistic** — ~18% of intended load was never offered.
+
+The warning tells you whether to *trust* the number, not whether the server is good.
+OCaml's is **trustworthy-and-catastrophic**; Elixir's is **untrustworthy-and-bad** —
+OCaml is arguably the worse server despite triggering no warning.
+
+**The old Go loadgen was self-saturating at 10k; the Odin rewrite proves the Go
+server never saturates.** Same Go server, two loadgens:
+
+| loadgen | Go @ 10k p99 | Go server CPU | clientcpu |
+|---|---|---|---|
+| old Go (goroutine-per-conn, ~20k goroutines) | ~140 ms | 5.26 | (not measured) |
+| new Odin (8-worker epoll reactor) | ~65 ms | 4.38 | 2.57 |
+
+The Go loadgen ran two goroutines per connection over 8 client cores, so a chunk of
+that 140 ms p99 was the *client's own* scheduler latency — and it had no
+`send%`/`clientcpu` instrumentation to reveal it. The lean Odin reactor costs only
+2.57 client cores at 10k, so the Go server's true p99 (~65 ms, 4.38/8 cores, headroom
+to spare) shows through. The sharpest demonstration is OCaml: the old loadgen reported
+**p50 = 3,147 ms**, the Odin loadgen **p50 ≈ 90 ms** with p99 ≈ 8,800 ms — the old
+client was so starved it corrupted even the *median*, while the lean client keeps the
+median honest and exposes the real server tail. That 35× p50 drop is entirely a
+loadgen artifact, which is exactly why the rewrite (with `send%`/`clientcpu`) was
+worth doing.
+
+## Latency-stability fingerprints — odin, go, rust (top three)
+
+Across the top three the *median* is nearly identical (~28–36 ms) and p99 is
+comparable, so the interesting engineering signal is entirely in the **jitter**
+(per-1 s-window p99 coefficient of variation). Each language's jitter has a completely
+different fingerprint:
+
+| server | stability failure mode | worst at |
+|---|---|---|
+| **odin** | timer-granularity beat vs 20 Hz sends when *idle* | 5k (recovers at 10k) |
+| **go** | periodic GC pauses; scale with alloc volume | 10k |
+| **rust** | none — no GC, work-stealing balances tails | flat |
+
+**Odin is bumpier at 5k than at 10k (counterintuitive).** The tick loop is
+**timer-clocked** via the epoll timeout, with an integer-millisecond floor:
+
+```odin
+wait_ns := next_tick._nsec - now._nsec
+if wait_ns > 0 { timeout_ms = i32(wait_ns / 1_000_000) }   // floor to whole ms
+nev := epoll_wait(w.epfd, ..., timeout_ms)
+...
+if now._nsec >= next_tick._nsec { tick_room(...) }          // fire tick
+```
+
+At **5k** the worker is mostly idle (`cpu≈1.5/8`) and sleeps in `epoll_wait` between
+ticks, so cadence is set by that timeout — but 1/30 Hz = 33.3 ms floors to a 33 ms
+timeout, so ticks land at 33–34 ms. That beats against the client's 50 ms (20 Hz)
+send interval, and the p99 at 5k sits *right at the 50 ms beat knee* (49–56 ms); tiny
+tick-timing wobble shoves a fraction of requests across it → sawtooth tail
+(max/p99.9 swinging 48↔67 ms) and a CV spike to **0.043**. At **10k** the worker is
+busy: `epoll_wait` returns immediately full of events, the loop spins, and the tick is
+**work-clocked** rather than timer-clocked. Latency rises to a steady ~68 ms (*above*
+the beat knee) and the jitter washes out → CV back to ~0.004, bands tight. More load
+buys stability here.
+
+**Go is worst at 10k — the GC signature.** The server allocates on every tick and
+every frame:
+
+```go
+payload := make([]byte, 7+n*16)   // fresh snapshot buffer, per room, per tick
+b := make([]byte, 4+len(payload)) // fresh framing buffer, per broadcast
+```
+
+At 10k conns / 50 per room = ~200 room goroutines each `time.NewTicker`-ing at 30 Hz,
+this is a firehose of short-lived garbage → periodic GC, whose assist + brief STW work
+lands on the tail. The go@10k timeline shows exactly this: a ~65 ms baseline with
+**regular ~85 ms spikes every ~4–6 s**. The tick *timing* is fine (real
+`time.NewTicker`); it's the collector perturbing the tail, and because allocation
+volume scales with connections the CV climbs monotonically to **0.018** at 10k.
+
+**Rust is flat everywhere.** No GC → no periodic pause to inject a tail spike, and
+Tokio's work-stealing scheduler keeps per-worker load balanced so no single worker's
+tail runs away. CV pinned at ~0.003–0.004 at every load, and it **wins the tail at
+10k**: p99 ≈ 54 ms flat while Odin and Go rise to ~68 and ~65 ms. Rust trades a hair
+more per-request cost at low load (p50 ≈ 29 ms, from Tokio task overhead) for a tail
+that simply does not move.
+
+**Lesson.** All three top languages have essentially the same median and comparable
+p99; the differentiating signal is jitter, and each fingerprint is distinct: Odin's is
+a scheduling artifact that *disappears* under load, Go's is the runtime (GC) and
+*grows* with load, Rust's is absent by construction. To confirm directly: run Go with
+`GODEBUG=gctrace=1` (or `GOGC=off` for a short run) and check the spike timestamps
+line up with GC cycles; flatten the Odin 5k sawtooth by moving its tick loop to a
+self-clocked / higher-resolution timer instead of the ms-granular epoll timeout.

@@ -81,9 +81,10 @@ func (h *Hist) percentile(p float64) float64 {
 // ---- global counters ----
 
 var (
-	movesSent uint64
-	snapsRecv uint64
-	measured  uint64
+	movesSent     uint64
+	movesMeasured uint64 // moves fired in the post-warmup window (send% numerator)
+	snapsRecv     uint64
+	measured      uint64
 )
 
 // ---- per-window latency (stability over time) ----
@@ -253,6 +254,11 @@ func runConn(addr string, roomID uint32, rate int, dur, warm time.Duration, h *H
 			return
 		}
 		atomic.AddUint64(&movesSent, 1)
+		// send% is measured over the steady-state window only, matching the latency
+		// gate above: warmup ramp (conns still JOINing) must not count against it.
+		if now.Sub(start) > warm {
+			atomic.AddUint64(&movesMeasured, 1)
+		}
 	}
 }
 
@@ -322,10 +328,16 @@ func main() {
 	// Loadgen self-checks: if the client is CPU-bound or can't keep its send
 	// schedule, the latency above measures the client, not the server.
 	clientCPU := selfCPUCores(secs)
-	sendTarget := float64(*conns) * float64(*rate) * (*warm + *dur).Seconds()
+	// send% covers ONLY the steady-state (post-warmup) window. A connection enters
+	// the send schedule after JOIN, so charging it for the warmup ramp understated
+	// healthy runs and penalized servers with a slightly heavier accept path. By the
+	// measured window every conn is joined and should send at full rate, so a dip
+	// here means a genuine mid-run sender stall, not establishment slack.
+	mm := atomic.LoadUint64(&movesMeasured)
+	sendTarget := float64(*conns) * float64(*rate) * dur.Seconds()
 	sendRatePct := 100.0
 	if sendTarget > 0 {
-		sendRatePct = 100.0 * float64(ms) / sendTarget
+		sendRatePct = 100.0 * float64(mm) / sendTarget
 	}
 	log.Printf("loadgen self-check: client_cpu=%.2f cores  send_rate=%.1f%% of target",
 		clientCPU, sendRatePct)
