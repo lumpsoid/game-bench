@@ -3,7 +3,7 @@
 A realistic throughput/latency benchmark for request handling across six runtimes,
 using a **mini authoritative game server** + an automated **load-generator client**.
 
-Servers to compare: **Go, Rust, OCaml, Odin, Elixir (bare BEAM), Python, Lua (LuaJIT).**
+Servers to compare: **Go, Rust, OCaml, Odin, Zig, Elixir (bare BEAM), Python, Lua (LuaJIT).**
 Wire protocol: raw TCP, `u32` length-prefixed frames — see [PROTOCOL.md](PROTOCOL.md).
 Fairness rules: see [METHODOLOGY.md](METHODOLOGY.md).
 
@@ -45,6 +45,13 @@ results/             raw output + plots
       opened per worker via `SO_REUSEPORT` so the kernel load-balances accepts.
       Same shard-the-rooms multi-core model as the Python server, but with OS
       threads instead of processes. Idle RSS is tiny (~3 MB). See header in `main.odin`.
+- [x] **Zig** server (`servers/zig`, raw epoll) — built + smoke-tested. Same
+      architecture as Odin: no async runtime, so a **thread-per-core sharded
+      reactor** — `-workers N` independent single-threaded epoll loops, each owning
+      its own connections and rooms (no locks on game state), listener opened per
+      worker via `SO_REUSEPORT`. Uses `std.heap.smp_allocator` and raw `std.os.linux`
+      syscalls (Zig 0.16 dropped the blocking socket wrappers from `std.posix`). Idle
+      RSS ~3 MB. See header in `server.zig`.
 - [x] **Lua** server (`servers/lua`, LuaJIT + cqueues) — smoke-tested + short runner
       run. Lua has no stdlib networking and no in-state parallelism, so it uses the
       **same multi-core story as Python**: one cqueues event loop per process, N
@@ -111,12 +118,13 @@ ramp (see METHODOLOGY.md), which the `runner/` will drive.
 elixir servers/elixir/server.exs      -addr :9000 -tick 30
 python3 servers/python/server.py      -addr :9000 -tick 30
 ./servers/odin/server-odin            -addr :9000 -tick 30 -workers 4   # odin build . -out:server-odin -o:speed first
+./servers/zig/server-zig              -addr :9000 -tick 30 -workers 4   # zig build-exe server.zig -O ReleaseFast -femit-bin=server-zig first
 luajit servers/lua/server.lua         -addr :9000 -tick 30   # install cqueues first — see servers/lua/README.md
 # ocaml: dune build --profile release && ./_build/default/main.exe -addr :9000 -tick 30
 ```
 
-Odin takes `-workers N` (default 1) to set its core budget, the way the others
-take `GOMAXPROCS` / `-domains` / `+S`; the runner passes `-workers = #server cores`.
+Odin and Zig take `-workers N` (default 1) to set their core budget, the way the
+others take `GOMAXPROCS` / `-domains` / `+S`; the runner passes `-workers = #server cores`.
 
 ## Quick start (single box, smoke test)
 

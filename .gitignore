@@ -1,6 +1,9 @@
 /servers/ocaml/_build
 /servers/rust/target
 /servers/odin/server-odin
+/servers/zig/server-zig
+/servers/zig/.zig-cache
+/servers/zig/server-zig.o
 runner/__pycache__/
 /results
 /loadgen/loadgen

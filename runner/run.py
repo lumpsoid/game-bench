@@ -92,6 +92,14 @@ def spec_odin(port, tick, cores):
     return [(argv, {}, cpuspec(cores))]
 
 
+def spec_zig(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/zig/server-zig")
+    # Same thread-per-core sharded reactor as Odin: one process, N worker threads
+    # pinned to all server cores, SO_REUSEPORT kernel-load-balances accepts.
+    argv = [exe, "-addr", f":{port}", "-tick", str(tick), "-workers", str(len(cores))]
+    return [(argv, {}, cpuspec(cores))]
+
+
 def spec_elixir(port, tick, cores):
     script = os.path.join(ROOT, "servers/elixir/server.exs")
     n = len(cores)
@@ -127,6 +135,7 @@ SERVERS = {
     "rust":   {"build": (["cargo", "build", "--release"], "servers/rust"),                  "spec": spec_rust},
     "ocaml":  {"build": (["opam", "exec", "--", "dune", "build", "--profile", "release"], "servers/ocaml"), "spec": spec_ocaml},
     "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
+    "zig":    {"build": (["zig", "build-exe", "server.zig", "-O", "ReleaseFast", "-femit-bin=server-zig"], "servers/zig"), "spec": spec_zig},
     "elixir": {"build": None,                                                                "spec": spec_elixir},
     "python": {"build": None,                                                                "spec": spec_python},
     "lua":    {"build": None,                                                                "spec": spec_lua},
