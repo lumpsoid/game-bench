@@ -7,6 +7,8 @@
 /servers/dart/server-dart
 /servers/dart/.dart_tool
 /servers/dart/*.dill
+/servers/swift/.build
+/servers/swift/Package.resolved
 /servers/clojure/libs
 /servers/clojure/.cpcache
 /servers/clojure/classes

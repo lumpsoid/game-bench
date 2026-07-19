@@ -109,6 +109,15 @@ def spec_dart(port, tick, cores):
     return [(argv, {}, cpuspec(cores))]
 
 
+def spec_swift(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/swift/.build/release/server-swift")
+    # One process, N event loops (SwiftNIO MultiThreadedEventLoopGroup), pinned to all
+    # server cores. One listener; NIO spreads accepted connections across the loops
+    # (event-loop-per-core, like Rust/tokio — not SO_REUSEPORT-sharded like Odin/Zig).
+    argv = [exe, "-addr", f":{port}", "-tick", str(tick), "-workers", str(len(cores))]
+    return [(argv, {}, cpuspec(cores))]
+
+
 def spec_clojure(port, tick, cores):
     script = os.path.join(ROOT, "servers/clojure/server.clj")
     n = len(cores)
@@ -161,6 +170,7 @@ SERVERS = {
     "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
     "zig":    {"build": (["zig", "build-exe", "server.zig", "-O", "ReleaseFast", "-femit-bin=server-zig"], "servers/zig"), "spec": spec_zig},
     "dart":   {"build": (["dart", "compile", "exe", "server.dart", "-o", "server-dart"], "servers/dart"), "spec": spec_dart},
+    "swift":  {"build": (["swift", "build", "-c", "release"], "servers/swift"),             "spec": spec_swift},
     # clojure: no build step — server.clj runs in script mode and needs only the
     # base clojure the CLI already provides (+ a JDK 21+ for virtual threads).
     "clojure":{"build": None,                                                                   "spec": spec_clojure},

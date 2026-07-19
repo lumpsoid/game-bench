@@ -3,7 +3,7 @@
 A realistic throughput/latency benchmark for request handling across six runtimes,
 using a **mini authoritative game server** + an automated **load-generator client**.
 
-Servers to compare: **Go, Rust, OCaml, Odin, Zig, Dart, Clojure (JVM/Loom), Elixir (bare BEAM), Python, Lua (LuaJIT).**
+Servers to compare: **Go, Rust, OCaml, Odin, Zig, Dart, Swift (SwiftNIO), Clojure (JVM/Loom), Elixir (bare BEAM), Python, Lua (LuaJIT).**
 Wire protocol: raw TCP, `u32` length-prefixed frames — see [PROTOCOL.md](PROTOCOL.md).
 Fairness rules: see [METHODOLOGY.md](METHODOLOGY.md).
 
@@ -71,6 +71,18 @@ results/             raw output + plots
       CLI at the Loom-capable JDK 26 via **`JAVA_CMD`** (the `clojure` wrapper ignores
       `JAVA_HOME`). Idle RSS ~214 MB — the classic JVM footprint, a sharp contrast to
       Zig's 3 MB / Dart's 47 MB. See header in `server.clj`.
+- [x] **Swift** server (`servers/swift`, SwiftNIO) — built + smoke-tested + short runner
+      run. The idiomatic server-side Swift story: an **event-loop-per-core reactor** on
+      NIO's `MultiThreadedEventLoopGroup` (`-workers N` threads, one event loop each) —
+      the direct parallel to Rust/tokio, in ONE shared-memory process. Unlike Odin/Zig/
+      Dart it is NOT SO_REUSEPORT-sharded: one listener accepts and NIO spreads the
+      child channels across the loops. Ports the reference actor model cleanly — each
+      **room is pinned to one loop and owns its state there** (no locks); its tick is a
+      repeated task on that loop, and MOVE/JOIN/LEAVE hop onto it via `loop.execute`.
+      Broadcasts go out with `Channel.writeAndFlush` (thread-safe, serialized per
+      socket); a backed-up client trips the write-buffer high-water mark → `!isWritable`
+      and the room sheds its snapshot. ARC, not tracing-GC — no stop-the-world pauses.
+      Idle RSS ~24 MB. See header in `Sources/server-swift/main.swift`.
 - [x] **Lua** server (`servers/lua`, LuaJIT + cqueues) — smoke-tested + short runner
       run. Lua has no stdlib networking and no in-state parallelism, so it uses the
       **same multi-core story as Python**: one cqueues event loop per process, N
@@ -139,12 +151,13 @@ python3 servers/python/server.py      -addr :9000 -tick 30
 ./servers/odin/server-odin            -addr :9000 -tick 30 -workers 4   # odin build . -out:server-odin -o:speed first
 ./servers/zig/server-zig              -addr :9000 -tick 30 -workers 4   # zig build-exe server.zig -O ReleaseFast -femit-bin=server-zig first
 ./servers/dart/server-dart            -addr :9000 -tick 30 -workers 4   # dart compile exe server.dart -o server-dart first
+./servers/swift/.build/release/server-swift -addr :9000 -tick 30 -workers 4   # (cd servers/swift && swift build -c release) first
 JAVA_CMD=/usr/lib/jvm/java-26-openjdk/bin/java clojure -M servers/clojure/server.clj -addr :9000 -tick 30 -workers 4   # needs JDK 21+ & clojure CLI
 luajit servers/lua/server.lua         -addr :9000 -tick 30   # install cqueues first — see servers/lua/README.md
 # ocaml: dune build --profile release && ./_build/default/main.exe -addr :9000 -tick 30
 ```
 
-Odin, Zig, Dart, and Clojure take `-workers N` (default 1) to set their core budget, the
+Odin, Zig, Dart, Swift, and Clojure take `-workers N` (default 1) to set their core budget, the
 way the others take `GOMAXPROCS` / `-domains` / `+S`; the runner passes `-workers = #server cores`
 (for Clojure this pins the virtual-thread carrier pool).
 
