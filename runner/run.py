@@ -100,6 +100,15 @@ def spec_zig(port, tick, cores):
     return [(argv, {}, cpuspec(cores))]
 
 
+def spec_dart(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/dart/server-dart")
+    # One process, N worker ISOLATES (shared-nothing, real parallelism), pinned to
+    # all server cores. `shared:true` binds let the Dart runtime load-balance
+    # accepts across isolates — same shard-the-rooms model as Odin's threads.
+    argv = [exe, "-addr", f":{port}", "-tick", str(tick), "-workers", str(len(cores))]
+    return [(argv, {}, cpuspec(cores))]
+
+
 def spec_elixir(port, tick, cores):
     script = os.path.join(ROOT, "servers/elixir/server.exs")
     n = len(cores)
@@ -136,6 +145,7 @@ SERVERS = {
     "ocaml":  {"build": (["opam", "exec", "--", "dune", "build", "--profile", "release"], "servers/ocaml"), "spec": spec_ocaml},
     "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
     "zig":    {"build": (["zig", "build-exe", "server.zig", "-O", "ReleaseFast", "-femit-bin=server-zig"], "servers/zig"), "spec": spec_zig},
+    "dart":   {"build": (["dart", "compile", "exe", "server.dart", "-o", "server-dart"], "servers/dart"), "spec": spec_dart},
     "elixir": {"build": None,                                                                "spec": spec_elixir},
     "python": {"build": None,                                                                "spec": spec_python},
     "lua":    {"build": None,                                                                "spec": spec_lua},

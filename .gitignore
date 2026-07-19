@@ -4,6 +4,9 @@
 /servers/zig/server-zig
 /servers/zig/.zig-cache
 /servers/zig/server-zig.o
+/servers/dart/server-dart
+/servers/dart/.dart_tool
+/servers/dart/*.dill
 runner/__pycache__/
 /results
 /loadgen/loadgen

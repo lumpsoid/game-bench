@@ -3,7 +3,7 @@
 A realistic throughput/latency benchmark for request handling across six runtimes,
 using a **mini authoritative game server** + an automated **load-generator client**.
 
-Servers to compare: **Go, Rust, OCaml, Odin, Zig, Elixir (bare BEAM), Python, Lua (LuaJIT).**
+Servers to compare: **Go, Rust, OCaml, Odin, Zig, Dart, Elixir (bare BEAM), Python, Lua (LuaJIT).**
 Wire protocol: raw TCP, `u32` length-prefixed frames — see [PROTOCOL.md](PROTOCOL.md).
 Fairness rules: see [METHODOLOGY.md](METHODOLOGY.md).
 
@@ -52,6 +52,14 @@ results/             raw output + plots
       worker via `SO_REUSEPORT`. Uses `std.heap.smp_allocator` and raw `std.os.linux`
       syscalls (Zig 0.16 dropped the blocking socket wrappers from `std.posix`). Idle
       RSS ~3 MB. See header in `server.zig`.
+- [x] **Dart** server (`servers/dart`, AOT-compiled) — built + smoke-tested. A GC'd,
+      single-threaded-event-loop-per-isolate runtime (like Python's asyncio), but
+      isolates are shared-nothing and run in **real parallel** on OS threads, so
+      Dart gets multi-core inside ONE process: `-workers N` isolates each bind the
+      port with `shared:true` and the runtime load-balances accepts across them
+      (SO_REUSEPORT equivalent). Same shard-the-rooms model as Odin/Zig, but with
+      GC and no locks (isolates share no memory). Idle RSS ~47 MB. See header in
+      `server.dart`.
 - [x] **Lua** server (`servers/lua`, LuaJIT + cqueues) — smoke-tested + short runner
       run. Lua has no stdlib networking and no in-state parallelism, so it uses the
       **same multi-core story as Python**: one cqueues event loop per process, N
@@ -119,12 +127,13 @@ elixir servers/elixir/server.exs      -addr :9000 -tick 30
 python3 servers/python/server.py      -addr :9000 -tick 30
 ./servers/odin/server-odin            -addr :9000 -tick 30 -workers 4   # odin build . -out:server-odin -o:speed first
 ./servers/zig/server-zig              -addr :9000 -tick 30 -workers 4   # zig build-exe server.zig -O ReleaseFast -femit-bin=server-zig first
+./servers/dart/server-dart            -addr :9000 -tick 30 -workers 4   # dart compile exe server.dart -o server-dart first
 luajit servers/lua/server.lua         -addr :9000 -tick 30   # install cqueues first — see servers/lua/README.md
 # ocaml: dune build --profile release && ./_build/default/main.exe -addr :9000 -tick 30
 ```
 
-Odin and Zig take `-workers N` (default 1) to set their core budget, the way the
-others take `GOMAXPROCS` / `-domains` / `+S`; the runner passes `-workers = #server cores`.
+Odin, Zig, and Dart take `-workers N` (default 1) to set their core budget, the way
+the others take `GOMAXPROCS` / `-domains` / `+S`; the runner passes `-workers = #server cores`.
 
 ## Quick start (single box, smoke test)
 
