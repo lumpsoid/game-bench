@@ -7,6 +7,9 @@
 /servers/dart/server-dart
 /servers/dart/.dart_tool
 /servers/dart/*.dill
+/servers/clojure/libs
+/servers/clojure/.cpcache
+/servers/clojure/classes
 runner/__pycache__/
 /results
 /loadgen/loadgen

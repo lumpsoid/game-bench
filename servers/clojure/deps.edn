@@ -1,0 +1,12 @@
+;; Clojure game server deps. Needs a JDK 21+ for virtual threads (Loom); this box
+;; has one at /usr/lib/jvm/java-26-openjdk while the default `java` is 17. The clojure
+;; CLI ignores JAVA_HOME but honors JAVA_CMD, so run with:
+;;
+;;   JAVA_CMD=/usr/lib/jvm/java-26-openjdk/bin/java \
+;;     clojure -J-Djdk.virtualThreadScheduler.parallelism=4 \
+;;     -M server.clj -addr :9000 -tick 30 -workers 4
+;;
+;; server.clj runs in script mode (it calls -main with *command-line-args* at the
+;; bottom), so no :main alias is needed.
+{:deps {org.clojure/clojure {:mvn/version "1.12.0"}}
+ :paths ["."]}
