@@ -3,7 +3,7 @@
 A realistic throughput/latency benchmark for request handling across six runtimes,
 using a **mini authoritative game server** + an automated **load-generator client**.
 
-Servers to compare: **Go, Rust, OCaml, Odin, Elixir (bare BEAM), Python.**
+Servers to compare: **Go, Rust, OCaml, Odin, Elixir (bare BEAM), Python, Lua (LuaJIT).**
 Wire protocol: raw TCP, `u32` length-prefixed frames — see [PROTOCOL.md](PROTOCOL.md).
 Fairness rules: see [METHODOLOGY.md](METHODOLOGY.md).
 
@@ -45,7 +45,15 @@ results/             raw output + plots
       opened per worker via `SO_REUSEPORT` so the kernel load-balances accepts.
       Same shard-the-rooms multi-core model as the Python server, but with OS
       threads instead of processes. Idle RSS is tiny (~3 MB). See header in `main.odin`.
-- [x] `runner/` orchestration + RSS/CPU sampling — `runner/run.py`, validated on all 6
+- [x] **Lua** server (`servers/lua`, LuaJIT + cqueues) — smoke-tested + short runner
+      run. Lua has no stdlib networking and no in-state parallelism, so it uses the
+      **same multi-core story as Python**: one cqueues event loop per process, N
+      processes sharding rooms via `SO_REUSEPORT`. Within a process it mirrors the Go
+      reference model (reader + writer coroutine per conn, room owns state, shed the
+      freshest snapshot when a client is backed up). Idle RSS ~18 MB at a few hundred
+      conns. cqueues install + notes in [servers/lua/README.md](servers/lua/README.md);
+      see header in `server.lua`.
+- [x] `runner/` orchestration + RSS/CPU sampling — `runner/run.py`, validated on all 7
 - [x] plots — `runner/plot.py` renders `results.csv` into a self-contained,
       theme-aware HTML report of saturation curves (no deps)
 
@@ -103,6 +111,7 @@ ramp (see METHODOLOGY.md), which the `runner/` will drive.
 elixir servers/elixir/server.exs      -addr :9000 -tick 30
 python3 servers/python/server.py      -addr :9000 -tick 30
 ./servers/odin/server-odin            -addr :9000 -tick 30 -workers 4   # odin build . -out:server-odin -o:speed first
+luajit servers/lua/server.lua         -addr :9000 -tick 30   # install cqueues first — see servers/lua/README.md
 # ocaml: dune build --profile release && ./_build/default/main.exe -addr :9000 -tick 30
 ```
 

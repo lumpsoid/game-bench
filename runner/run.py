@@ -109,6 +109,17 @@ def spec_python(port, tick, cores):
     ]
 
 
+def spec_lua(port, tick, cores):
+    script = os.path.join(ROOT, "servers/lua/server.lua")
+    # Same multi-core story as Python: LuaJIT is single-threaded per state, so run
+    # one process per server core (SO_REUSEPORT shares the port), each pinned to a
+    # single core. The script self-bootstraps its local cqueues rocks tree.
+    return [
+        (["luajit", script, "-addr", f":{port}", "-tick", str(tick)], {}, str(c))
+        for c in cores
+    ]
+
+
 SERVERS = {
     "go":     {"build": (["go", "build", "-o", "gosrv", "."], "servers/go"),               "spec": spec_go},
     "go-pool":{"build": (["go", "build", "-o", "gosrv-pool", "."], "servers/go-pool"),      "spec": spec_go_pool},
@@ -118,6 +129,7 @@ SERVERS = {
     "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
     "elixir": {"build": None,                                                                "spec": spec_elixir},
     "python": {"build": None,                                                                "spec": spec_python},
+    "lua":    {"build": None,                                                                "spec": spec_lua},
 }
 
 
