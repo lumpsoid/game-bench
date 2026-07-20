@@ -381,3 +381,75 @@ the goroutines bought 94%. The reactor is the right tool when footprint and CPU 
 connection matter (many idle/slow conns); the goroutine model is simpler and keeps the
 tail flatter under heavy per-room fan-out. Data: `results/pool/results.csv`; report:
 `results/pool/report.html`.
+
+## The Dart 10k `send%` dip — single-thread GC starves the tick (investigated; latency mitigated, send% not)
+
+**Symptom.** At 10k connections the Dart server (`servers/dart`) trips the loadgen's
+coordinated-omission check: steady-state `send%` sits in the high-80s/low-90s (6-trial
+mean **91%**, range 87–96%) while Zig/Clojure hold ~100%. It happens at only ~5.5/8
+server cores — **nowhere near CPU saturation.** Latency is also poor: p50 ≈ 39 ms,
+p99 ≈ 73 ms.
+
+**Why `send%` is the signal (not throughput).** `send%` can only drop one way: the
+loadgen's fixed-rate send loop finds a connection's deadline has slipped past by more
+than a full interval and coalesces the missed sends away (see
+`## Reading the loadgen self-check`). Write backpressure does *not* lower it (moves are
+counted unconditionally). So a dip means the client's loop stalled — and since the
+client uses *less* CPU during Dart runs than during the (faster) Zig runs, it is not
+client overload. It is the pattern of what Dart puts on the wire.
+
+**Seven experiments, four dead ends.**
+
+| # | intervention | result | ruled out |
+|---|---|---|---|
+| 1 | `--new_gen_semi_max_size` bump | no change | GC *frequency* tuning |
+| 2 | `RawSocket` (drop `dart:io` high-level `Socket`) | −12% CPU, −17% RSS, dip persists | the IOSink write abstraction |
+| 3 | staggered tick (phase-slot rooms vs one `Timer.periodic` batch) | **−20% latency**, dip persists | within-tick emission burst |
+| 4 | isolate oversubscription (8→16→32 workers / 8 cores) | no change | conns-per-isolate / CPU |
+| 5 | tick instrumentation (`TICK_LOG`) | 8–12 ms per-fire blocks, gaps to 20 ms, at ~57% CPU/isolate | *(measured the cause)* |
+| 6 | self-paced chunked async tick (`await` between room chunks) | a single ≤4-room chunk still blocks ~6 ms | that async can hide it |
+| 7 | allocation-pooled hot paths | latency win holds; send% ~unchanged | *(see below)* |
+
+**Root cause.** On a single-threaded isolate the tick timer, socket reads, and writes
+all serialize on one thread. Periodic **stop-the-world GC pauses (~6–8 ms)** land inside
+a tick, blow the tick budget, and bunch snapshot emission into gap-then-burst. The client
+receives irregular bursts and its fixed-rate send loop occasionally overruns a deadline →
+`send%` dips. The spare cores can't help: one isolate is one thread and GC freezes it —
+which is exactly why it dips *while unsaturated*. Experiment 6 is the clincher: chunking
+to ≤4 rooms and yielding to I/O between chunks left the longest block at ~6 ms, and a
+handful of writes cannot take 6 ms — only a stop-the-world pause can, and `await` cannot
+run during one. This is why the failure is Dart-specific: Zig/Odin do cheap GC-free work
+that fits the tick budget and `epoll` inline; OCaml/Elixir fail into a *different* regime
+(uniform high tail / clean CPU saturation) rather than bursty gaps.
+
+**What allocation pooling changed — and didn't (`servers/dart-pool`).** The refined
+server strips the removable per-event allocations (ByteData views → direct big-endian
+byte-math; the inbound copy → parse-in-place from the read buffer; JOINED ack and
+per-pass room list → reused buffers). GC pause *frequency* drops (allocation rate down)
+but *magnitude* does not (set by the live-set), and a hard floor remains: **`RawSocket.read()`
+allocates a fresh `Uint8List` per read (~200k/s at 10k) and `dart:io` exposes no
+read-into API.** Net over 6 trials at 10k:
+
+- **`send%`: not robustly improved** — pool mean 93% vs baseline 91%, both high-variance
+  (pool range 85–99%), both still dip below the 97% threshold on most trials. The
+  read()-driven GC-pause floor persists.
+- **latency: robustly and substantially improved** — p50 **38.6 → 25.9 ms (−33%)**, p99
+  **73.2 → 51.8 ms (−29%)** on *every* trial, at lower CPU (5.5 → 5.2) and RSS
+  (119 → 103 MB). This win is from the RawSocket reactor + spread tick, retained in the
+  pooled server.
+
+**Residual (genuine characteristic, not a bug).** The 10k `send%` dip is a real property
+of Dart's single-threaded-isolate model: a fine-grained game tick cannot be held on time
+under fan-out because stop-the-world GC on the one thread bunches delivery. It is **not
+fixable in idiomatic Dart** — closing it fully would mean dropping below `dart:io`'s
+socket API (FFI `epoll`+`recv` into reused buffers), at which point it is no longer a Dart
+program in any meaningful sense. Practical outcome: `servers/dart-pool` supersedes
+`servers/dart` for its ~30% latency and lower CPU/RSS; treat the residual few-percent
+`send%` dip as Dart's cost of a GC'd single-threaded event loop — the analogue of OCaml's
+tail-latency regime and Elixir's CPU cost, a characteristic to report, not a defect.
+
+**Artifacts.** `servers/dart-pool/server.dart` (RawSocket + self-paced chunked tick +
+pooled hot paths). `TICK_LOG=<path>` enables per-isolate tick-timing logs
+(`maxChunkMs` = longest contiguous on-loop block; dormant unless set). Intermediate
+variants (raw / staggered-tick / async) were rungs on the ladder — their deltas are the
+table above.

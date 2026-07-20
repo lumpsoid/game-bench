@@ -109,6 +109,17 @@ def spec_dart(port, tick, cores):
     return [(argv, {}, cpuspec(cores))]
 
 
+def spec_dart_pool(port, tick, cores):
+    exe = os.path.join(ROOT, "servers/dart-pool/server-dart-pool")
+    # The refined Dart server: RawSocket reactor + self-paced chunked async tick loop
+    # + allocation-pooled hot paths (byte-math parse, in-place read, reused buffers).
+    # This is the outcome of the investigation in FINDINGS.md (§ "The Dart 10k dip"):
+    # it lifts steady-state send% from ~90% (spec_dart) to ~98% by cutting the GC
+    # pressure that was starving the tick timer. See servers/dart-pool/server.dart.
+    argv = [exe, "-addr", f":{port}", "-tick", str(tick), "-workers", str(len(cores))]
+    return [(argv, {}, cpuspec(cores))]
+
+
 def spec_swift(port, tick, cores):
     exe = os.path.join(ROOT, "servers/swift/.build/release/server-swift")
     # One process, N event loops (SwiftNIO MultiThreadedEventLoopGroup), pinned to all
@@ -170,6 +181,7 @@ SERVERS = {
     "odin":   {"build": (["odin", "build", ".", "-out:server-odin", "-o:speed"], "servers/odin"), "spec": spec_odin},
     "zig":    {"build": (["zig", "build-exe", "server.zig", "-O", "ReleaseFast", "-femit-bin=server-zig"], "servers/zig"), "spec": spec_zig},
     "dart":   {"build": (["dart", "compile", "exe", "server.dart", "-o", "server-dart"], "servers/dart"), "spec": spec_dart},
+    "dart-pool":{"build": (["dart", "compile", "exe", "server.dart", "-o", "server-dart-pool"], "servers/dart-pool"), "spec": spec_dart_pool},
     "swift":  {"build": (["swift", "build", "-c", "release"], "servers/swift"),             "spec": spec_swift},
     # clojure: no build step — server.clj runs in script mode and needs only the
     # base clojure the CLI already provides (+ a JDK 21+ for virtual threads).

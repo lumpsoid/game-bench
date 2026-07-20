@@ -7,6 +7,9 @@
 /servers/dart/server-dart
 /servers/dart/.dart_tool
 /servers/dart/*.dill
+/servers/dart-pool/server-dart-pool
+/servers/dart-pool/.dart_tool
+/servers/dart-pool/*.dill
 /servers/swift/.build
 /servers/swift/Package.resolved
 /servers/clojure/libs

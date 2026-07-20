@@ -59,7 +59,10 @@ results/             raw output + plots
       port with `shared:true` and the runtime load-balances accepts across them
       (SO_REUSEPORT equivalent). Same shard-the-rooms model as Odin/Zig, but with
       GC and no locks (isolates share no memory). Idle RSS ~47 MB. See header in
-      `server.dart`.
+      `server.dart`. A refined variant `servers/dart-pool` (RawSocket reactor +
+      self-paced chunked tick + allocation-pooled hot paths) cuts p50/p99 latency
+      ~30% and lowers CPU/RSS; the 10k `send%` dip that motivated it is a GC-on-a-
+      single-thread characteristic, mitigated but not eliminated — see FINDINGS.md.
 - [x] **Clojure** server (`servers/clojure`, JVM + **virtual threads / Loom**) —
       built + smoke-tested. First JVM entrant; same shared-memory / real-parallelism /
       GC camp as the Go reference, so it ports the reference actor model directly: a
